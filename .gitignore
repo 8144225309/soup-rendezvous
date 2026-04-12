@@ -1,0 +1,29 @@
+# Rust
+/target
+**/*.rs.bk
+*.pdb
+Cargo.lock.bak
+
+# SQLite working files
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Local data and runtime state
+/data
+/var
+/run
+soup-rendezvous-data/
+
+# Environment
+.env
+.envrc
+
+# Editor / OS noise
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*~
