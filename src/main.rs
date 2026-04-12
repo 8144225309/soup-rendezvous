@@ -1,9 +1,17 @@
-use axum::{Router, routing::get};
-use std::net::SocketAddr;
+use std::sync::Arc;
+
+use clap::Parser;
 use tracing_subscriber::EnvFilter;
+
+use soup_rendezvous::config::Config;
+use soup_rendezvous::db::Db;
+use soup_rendezvous::db::sqlite::SqliteDb;
+use soup_rendezvous::http::{AppState, build_router};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let cfg = Config::parse();
+
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env()
@@ -11,25 +19,17 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let app = Router::new().route("/v0/health", get(health));
+    let db: Arc<dyn Db> = if cfg.db_path == ":memory:" {
+        Arc::new(SqliteDb::open_in_memory()?)
+    } else {
+        Arc::new(SqliteDb::open(&cfg.db_path)?)
+    };
 
-    let addr: SocketAddr = ([127, 0, 0, 1], 8090).into();
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    tracing::info!(%addr, "soup-rendezvous listening");
+    let state = AppState { db };
+    let app = build_router(state);
+
+    let listener = tokio::net::TcpListener::bind(cfg.bind).await?;
+    tracing::info!(addr = %cfg.bind, db_path = %cfg.db_path, "soup-rendezvous listening");
     axum::serve(listener, app).await?;
     Ok(())
-}
-
-async fn health() -> &'static str {
-    "ok"
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn health_returns_ok() {
-        assert_eq!(health().await, "ok");
-    }
 }
