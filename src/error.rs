@@ -21,6 +21,9 @@ pub enum ApiError {
     #[error("invalid request: {0}")]
     BadRequest(&'static str),
 
+    #[error("quota exceeded: {0}")]
+    QuotaExceeded(&'static str),
+
     #[error("internal error")]
     Internal(#[source] anyhow::Error),
 }
@@ -37,6 +40,7 @@ impl IntoResponse for ApiError {
             Self::NotFound => (StatusCode::NOT_FOUND, "not found".to_string()),
             Self::InvalidEnvelope(e) => (StatusCode::BAD_REQUEST, e.to_string()),
             Self::BadRequest(msg) => (StatusCode::BAD_REQUEST, (*msg).to_string()),
+            Self::QuotaExceeded(msg) => (StatusCode::TOO_MANY_REQUESTS, (*msg).to_string()),
             Self::Internal(e) => {
                 tracing::error!(error = ?e, "internal error");
                 (

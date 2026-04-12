@@ -8,19 +8,39 @@ use std::sync::Arc;
 use serde_json::{Value, json};
 use soup_rendezvous::db::Db;
 use soup_rendezvous::db::sqlite::SqliteDb;
-use soup_rendezvous::http::{AppState, build_router};
+use soup_rendezvous::http::{AppState, HttpLimits, build_router};
 
 async fn spawn_app() -> SocketAddr {
+    spawn_app_with_limits(HttpLimits::permissive_for_tests()).await
+}
+
+async fn spawn_app_with_limits(limits: HttpLimits) -> SocketAddr {
     let db: Arc<dyn Db> = Arc::new(SqliteDb::open_in_memory().unwrap());
-    let state = AppState { db };
+    let state = AppState {
+        db,
+        limits: Arc::new(limits),
+    };
     let app = build_router(state);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .unwrap();
     });
     addr
+}
+
+fn now_iso() -> String {
+    chrono::Utc::now().to_rfc3339()
+}
+
+fn iso_offset(offset_secs: i64) -> String {
+    (chrono::Utc::now() + chrono::Duration::seconds(offset_secs)).to_rfc3339()
 }
 
 fn pk_hex(byte: u8) -> String {
@@ -41,9 +61,9 @@ fn ad_body(host_byte: u8) -> Value {
         "min_members": 4,
         "max_members": 8,
         "approval_mode": "manual",
-        "join_window_opens_at": "2026-04-12T00:00:00Z",
-        "join_window_closes_at": "2026-04-19T00:00:00Z",
-        "created_at": "2026-04-12T01:00:00Z",
+        "join_window_opens_at": now_iso(),
+        "join_window_closes_at": iso_offset(7 * 86400),
+        "created_at": now_iso(),
         "nonce": "f4e9c1aabbccddee",
         "scheme_payload": {
             "lsp_pubkey": "02deadbeef",
@@ -60,8 +80,8 @@ fn attestation_body(joiner_byte: u8, advertisement_id: &str) -> Value {
         "scheme": "superscalar/v1",
         "joiner_pubkey": pk_hex(joiner_byte),
         "advertisement_id": advertisement_id,
-        "created_at": "2026-04-12T02:00:00Z",
-        "expires_at": "2026-04-13T02:00:00Z",
+        "created_at": now_iso(),
+        "expires_at": iso_offset(86400),
         "nonce": "0123456789abcdef",
         "signature": "..."
     })
@@ -77,7 +97,7 @@ fn seal_body(host_byte: u8, advertisement_id: &str) -> Value {
         "members": [
             {"joiner_pubkey": pk_hex(0xb1), "attestation_id": id_hex(0xc1)}
         ],
-        "created_at": "2026-04-13T01:00:00Z",
+        "created_at": now_iso(),
         "signature": "..."
     })
 }
@@ -339,4 +359,146 @@ async fn cohort_endpoint_unknown_is_404() {
         .await
         .unwrap();
     assert_eq!(res.status(), 404);
+}
+
+// ---------------------------------------------------------------------
+// Phase 4: rate limiting + abuse protection
+// ---------------------------------------------------------------------
+
+#[tokio::test]
+async fn body_too_large_is_413() {
+    // 1 KB body cap; the ad body with a giant `description` field will
+    // sail past it.
+    let limits = HttpLimits {
+        max_body_bytes: 1024,
+        ..HttpLimits::permissive_for_tests()
+    };
+    let addr = spawn_app_with_limits(limits).await;
+    let client = reqwest::Client::new();
+
+    let mut body = ad_body(0xaa);
+    body["description"] = Value::String("x".repeat(8 * 1024));
+
+    let res = post_event(&client, addr, &body).await;
+    assert_eq!(res.status(), 413);
+}
+
+#[tokio::test]
+async fn stale_created_at_is_rejected() {
+    let limits = HttpLimits {
+        clock_skew_secs: 60,
+        ..HttpLimits::permissive_for_tests()
+    };
+    let addr = spawn_app_with_limits(limits).await;
+    let client = reqwest::Client::new();
+
+    let mut body = ad_body(0xaa);
+    // Two hours in the past — well outside ±60s.
+    body["created_at"] = Value::String(iso_offset(-7200));
+
+    let res = post_event(&client, addr, &body).await;
+    assert_eq!(res.status(), 400);
+    let err: Value = res.json().await.unwrap();
+    assert!(err["error"].as_str().unwrap().contains("clock skew"));
+}
+
+#[tokio::test]
+async fn future_created_at_is_rejected() {
+    let limits = HttpLimits {
+        clock_skew_secs: 60,
+        ..HttpLimits::permissive_for_tests()
+    };
+    let addr = spawn_app_with_limits(limits).await;
+    let client = reqwest::Client::new();
+
+    let mut body = ad_body(0xaa);
+    body["created_at"] = Value::String(iso_offset(7200));
+
+    let res = post_event(&client, addr, &body).await;
+    assert_eq!(res.status(), 400);
+}
+
+#[tokio::test]
+async fn pubkey_storage_quota_returns_429() {
+    // Each ad body lands around 1.5 KB after timestamps and the
+    // 900-char description. With a 4 KB quota, two posts fit comfortably
+    // and the third pushes the running total past the cap.
+    let limits = HttpLimits {
+        pubkey_quota_bytes: 4096,
+        ..HttpLimits::permissive_for_tests()
+    };
+    let addr = spawn_app_with_limits(limits).await;
+    let client = reqwest::Client::new();
+
+    let mut a1 = ad_body(0xaa);
+    a1["description"] = Value::String("x".repeat(900));
+    a1["nonce"] = Value::String("first".into());
+    let r1 = post_event(&client, addr, &a1).await;
+    assert_eq!(r1.status(), 201);
+
+    let mut a2 = ad_body(0xaa);
+    a2["description"] = Value::String("y".repeat(900));
+    a2["nonce"] = Value::String("second".into());
+    let r2 = post_event(&client, addr, &a2).await;
+    assert_eq!(r2.status(), 201);
+
+    let mut a3 = ad_body(0xaa);
+    a3["description"] = Value::String("z".repeat(900));
+    a3["nonce"] = Value::String("third".into());
+    let r3 = post_event(&client, addr, &a3).await;
+    assert_eq!(r3.status(), 429);
+    let err: Value = r3.json().await.unwrap();
+    assert!(err["error"].as_str().unwrap().contains("quota"));
+}
+
+#[tokio::test]
+async fn rate_limit_kicks_in_under_burst() {
+    let limits = HttpLimits {
+        rate_per_sec: 1,
+        rate_burst: 3,
+        ..HttpLimits::permissive_for_tests()
+    };
+    let addr = spawn_app_with_limits(limits).await;
+    let client = reqwest::Client::new();
+
+    let mut last_status = 0;
+    let mut hit_429 = false;
+    for _ in 0..20u8 {
+        let res = client
+            .get(format!("http://{addr}/v0/events?kind=advertisement"))
+            .send()
+            .await
+            .unwrap();
+        last_status = res.status().as_u16();
+        if last_status == 429 {
+            hit_429 = true;
+            break;
+        }
+    }
+    assert!(
+        hit_429,
+        "expected at least one 429 within 20 burst requests, last status was {last_status}"
+    );
+}
+
+#[tokio::test]
+async fn health_endpoint_is_not_rate_limited() {
+    let limits = HttpLimits {
+        rate_per_sec: 1,
+        rate_burst: 1,
+        ..HttpLimits::permissive_for_tests()
+    };
+    let addr = spawn_app_with_limits(limits).await;
+    let client = reqwest::Client::new();
+
+    // Hammer health 10 times — none should be rejected because health
+    // is on the unlimited router branch.
+    for _ in 0..10u8 {
+        let res = client
+            .get(format!("http://{addr}/v0/health"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+    }
 }

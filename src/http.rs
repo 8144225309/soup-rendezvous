@@ -7,42 +7,115 @@
 //! - `GET  /v0/health`               liveness
 //!
 //! All POSTs accept any opaque JSON body up to a body-size cap enforced
-//! by tower middleware in phase 4. The server computes
+//! by the `DefaultBodyLimit` layer. The server computes
 //! `sha256(body)` -> id, extracts indexable metadata via
 //! [`crate::event::extract_metadata`], and stores. The server never
 //! verifies signatures, never canonicalizes, and never parses the
 //! `scheme_payload`.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::{
     Json, Router,
-    extract::{Path, Query, State},
+    extract::{DefaultBodyLimit, Path, Query, State},
     http::{HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use tower::ServiceBuilder;
+use tower_governor::{GovernorLayer, governor::GovernorConfigBuilder};
+use tower_http::timeout::TimeoutLayer;
+use tower_http::trace::TraceLayer;
 
 use crate::db::{Db, EventFilter, EventId, EventKind, Pubkey, StoredEvent};
 use crate::error::ApiError;
 use crate::event::extract_metadata;
 
+/// Configurable limits applied at the HTTP boundary. Held by [`AppState`]
+/// so handlers can inspect them and so [`build_router`] can install the
+/// appropriate tower layers.
+#[derive(Debug, Clone)]
+pub struct HttpLimits {
+    pub max_body_bytes: usize,
+    pub rate_per_sec: u32,
+    pub rate_burst: u32,
+    pub pubkey_quota_bytes: u64,
+    pub clock_skew_secs: i64,
+    pub timeout_secs: u64,
+}
+
+impl HttpLimits {
+    /// Generous defaults suitable for tests where no defense should
+    /// trip incidentally. Real deployments use [`Default`] or pass
+    /// values from the CLI config.
+    pub fn permissive_for_tests() -> Self {
+        Self {
+            max_body_bytes: 1_048_576,
+            rate_per_sec: 1_000,
+            rate_burst: 10_000,
+            pubkey_quota_bytes: 1_073_741_824,
+            clock_skew_secs: 86_400,
+            timeout_secs: 60,
+        }
+    }
+}
+
+impl Default for HttpLimits {
+    fn default() -> Self {
+        Self {
+            max_body_bytes: 65_536,
+            rate_per_sec: 5,
+            rate_burst: 30,
+            pubkey_quota_bytes: 1_048_576,
+            clock_skew_secs: 300,
+            timeout_secs: 30,
+        }
+    }
+}
+
 /// Shared application state held in axum's `State` extractor.
 #[derive(Clone)]
 pub struct AppState {
     pub db: Arc<dyn Db>,
+    pub limits: Arc<HttpLimits>,
 }
 
-/// Build the router for the application. Used by `main` and by
-/// integration tests in `tests/integration.rs`.
+/// Build the router for the application. Installs the configured tower
+/// layers (rate limit, body size cap, timeout, trace) on every route
+/// except `/v0/health`, which is excluded from the rate limit so liveness
+/// probes can't be locked out by another client's burst.
 pub fn build_router(state: AppState) -> Router {
-    Router::new()
-        .route("/v0/health", get(health))
+    let governor_conf = Arc::new(
+        GovernorConfigBuilder::default()
+            .per_second(state.limits.rate_per_sec.max(1) as u64)
+            .burst_size(state.limits.rate_burst.max(1))
+            .finish()
+            .expect("valid governor config"),
+    );
+
+    let limited = Router::new()
         .route("/v0/events", post(post_event).get(list_events))
         .route("/v0/events/{id}", get(get_event))
         .route("/v0/cohorts/{id}", get(get_cohort))
+        .layer(
+            ServiceBuilder::new()
+                .layer(TraceLayer::new_for_http())
+                .layer(TimeoutLayer::with_status_code(
+                    StatusCode::REQUEST_TIMEOUT,
+                    Duration::from_secs(state.limits.timeout_secs),
+                ))
+                .layer(GovernorLayer {
+                    config: governor_conf,
+                })
+                .layer(DefaultBodyLimit::max(state.limits.max_body_bytes)),
+        );
+
+    Router::new()
+        .route("/v0/health", get(health))
+        .merge(limited)
         .with_state(state)
 }
 
@@ -59,9 +132,33 @@ async fn post_event(
     body: axum::body::Bytes,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     let ingested = extract_metadata(&body)?;
+
+    // Reject events whose declared created_at is too far from the
+    // server clock. Catches stale events being replayed and clients
+    // with badly-skewed clocks.
+    let now = chrono::Utc::now().timestamp();
+    let skew = (ingested.created_at - now).abs();
+    if skew > state.limits.clock_skew_secs {
+        return Err(ApiError::BadRequest(
+            "created_at outside allowed clock skew window",
+        ));
+    }
+
+    // Per-pubkey storage quota. The author pubkey for an advertisement
+    // or seal is the host; for an attestation it's the joiner. The
+    // check is best-effort and racy under concurrent posts from the
+    // same key, which is acceptable for the prototype: the worst case
+    // is the quota overshoots by one body's size between concurrent
+    // requests.
+    if let Some(author) = ingested.author_pubkey() {
+        let used = state.db.bytes_stored_by_pubkey(&author)?;
+        let new_total = used.saturating_add(ingested.body.len() as u64);
+        if new_total > state.limits.pubkey_quota_bytes {
+            return Err(ApiError::QuotaExceeded("pubkey storage quota exceeded"));
+        }
+    }
+
     let id = state.db.put_event(&ingested)?;
-    // Always 201; insertions are idempotent so re-posting an existing
-    // body returns the same id and is also a 201.
     Ok((StatusCode::CREATED, Json(json!({ "id": id.to_hex() }))))
 }
 
@@ -266,5 +363,13 @@ mod tests {
     #[tokio::test]
     async fn health_returns_ok() {
         assert_eq!(health().await, "ok");
+    }
+
+    #[test]
+    fn http_limits_defaults_are_sensible() {
+        let l = HttpLimits::default();
+        assert!(l.max_body_bytes >= 16_384);
+        assert!(l.rate_per_sec >= 1);
+        assert!(l.clock_skew_secs >= 60);
     }
 }

@@ -133,6 +133,17 @@ pub struct IngestedEvent {
     pub body: Vec<u8>,
 }
 
+impl IngestedEvent {
+    /// The pubkey that authored this event. For an advertisement or
+    /// sealed_cohort that's the host_pubkey; for a join_attestation
+    /// that's the joiner_pubkey. Returns None only if the event was
+    /// constructed without either, which never happens via the
+    /// extract_metadata pipeline.
+    pub fn author_pubkey(&self) -> Option<Pubkey> {
+        self.host_pubkey.or(self.joiner_pubkey)
+    }
+}
+
 /// An event read back from storage.
 #[derive(Debug, Clone)]
 pub struct StoredEvent {
