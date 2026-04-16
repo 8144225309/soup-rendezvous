@@ -1281,6 +1281,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "hex",
+ "nostr",
  "nostr-sdk",
  "serde",
  "serde_json",

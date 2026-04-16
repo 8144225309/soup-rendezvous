@@ -1,7 +1,4 @@
-//! Event builders for the three-phase coordination protocol.
-//!
-//! Each function constructs a Nostr event with the correct kind, tags,
-//! and content for its role in the advertise / attest / seal lifecycle.
+//! Event builders for the coordination protocol.
 
 use nostr_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -25,15 +22,39 @@ pub struct SuperScalarPayload {
     pub lsp_fee_ppm: u32,
 }
 
+/// Joiner's attestation payload (encrypted to host via NIP-44).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AttestationPayload {
+    pub joiner_cln_pubkey: String,
+    pub joiner_cln_endpoint: String,
+    pub joiner_nostr_relays: Vec<String>,
+    pub nonce: String,
+    pub message: String,
+}
+
+/// Seal manifest (encrypted to each cohort member via NIP-44).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SealManifest {
+    pub advertisement_id: String,
+    pub rules_hash: String,
+    pub members: Vec<SealMember>,
+    pub sealed_at: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SealMember {
+    pub nostr_pubkey: String,
+    pub cln_pubkey: String,
+    pub cln_endpoint: String,
+    pub slot: u32,
+}
+
 /// Build the coordinator's root discovery thread event.
-/// This is a long-lived addressable event that factory advertisements
-/// reply to.
 pub fn build_root_thread(description: &str) -> EventBuilder {
     EventBuilder::new(kinds::ADVERTISEMENT, description).tag(Tag::identifier("root"))
 }
 
 /// Build a factory advertisement event.
-/// Replies to the coordinator's root thread via an e-tag.
 #[allow(clippy::too_many_arguments)]
 pub fn build_advertisement(
     root_event_id: &EventId,
@@ -107,8 +128,7 @@ pub fn build_status_update(
         ))
 }
 
-/// Build a vouch event — coordinator attesting that a host proved
-/// control of an LN node.
+/// Build a vouch event.
 pub fn build_vouch(
     host_pubkey: &PublicKey,
     ln_node_id: &str,
@@ -128,4 +148,59 @@ pub fn build_vouch(
             TagKind::custom("ln_node_id"),
             vec![ln_node_id.to_string()],
         ))
+}
+
+/// Build an encrypted attestation (join request).
+/// The content is NIP-44 encrypted to the host's pubkey by the caller.
+pub fn build_attestation(ad_event_id: &EventId, scheme: &str, expiry_unix: u64) -> EventBuilder {
+    // Content will be set by the caller after NIP-44 encryption.
+    // We build with empty content; the caller replaces it.
+    EventBuilder::new(kinds::ATTESTATION, "")
+        .tag(Tag::event(*ad_event_id))
+        .tag(Tag::custom(
+            TagKind::custom("scheme"),
+            vec![scheme.to_string()],
+        ))
+        .tag(Tag::custom(
+            TagKind::custom("expiry"),
+            vec![expiry_unix.to_string()],
+        ))
+}
+
+/// Build a seal event. Content is the encrypted manifest.
+pub fn build_seal(ad_event_id: &EventId, scheme: &str) -> EventBuilder {
+    EventBuilder::new(kinds::SEAL, "")
+        .tag(Tag::event(*ad_event_id))
+        .tag(Tag::custom(
+            TagKind::custom("scheme"),
+            vec![scheme.to_string()],
+        ))
+}
+
+// --- helpers for extracting tags from fetched events ---
+
+pub fn get_tag_value(event: &Event, tag_name: &str) -> Option<String> {
+    event
+        .tags
+        .iter()
+        .find(|t| t.kind() == TagKind::custom(tag_name))
+        .and_then(|t| t.content().map(|s| s.to_string()))
+}
+
+pub fn get_d_tag(event: &Event) -> Option<String> {
+    event
+        .tags
+        .iter()
+        .find(|t| t.kind() == TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::D)))
+        .and_then(|t| t.content().map(|s| s.to_string()))
+}
+
+pub fn get_e_tag(event: &Event) -> Option<EventId> {
+    event.tags.iter().find_map(|t| {
+        if t.kind() == TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::E)) {
+            t.content().and_then(|s| EventId::from_hex(s).ok())
+        } else {
+            None
+        }
+    })
 }
