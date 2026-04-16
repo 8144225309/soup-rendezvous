@@ -29,6 +29,10 @@ struct Cli {
     )]
     relays: String,
 
+    /// Path to CLN lightning-rpc directory (for checkmessage verification).
+    #[arg(long, env = "SOUP_LIGHTNING_DIR")]
+    lightning_dir: Option<PathBuf>,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -103,6 +107,30 @@ enum Command {
         ad_id: String,
     },
 
+    /// Generate a proof-of-node challenge string.
+    Challenge,
+
+    /// Verify an LN node proof and publish a vouch event.
+    Vouch {
+        /// The host's Nostr pubkey (hex or npub) to vouch for.
+        host_pubkey: String,
+        /// The LN node ID (33-byte hex pubkey from `lightning-cli getinfo`).
+        node_id: String,
+        /// The zbase-encoded signature from `lightning-cli signmessage`.
+        zbase: String,
+        /// The challenge string that was signed.
+        challenge: String,
+        /// Number of channels the node has (from getinfo or manual check).
+        #[arg(long, default_value_t = 0)]
+        channels: u32,
+        /// Total channel capacity in sats.
+        #[arg(long, default_value = "0")]
+        capacity_sat: String,
+    },
+
+    /// List vouches (verified LN node proofs) from the relays.
+    ListVouches,
+
     /// (Host) Seal a factory with a list of accepted joiner npubs.
     Seal {
         /// The advertisement event ID (hex).
@@ -171,6 +199,34 @@ async fn main() -> Result<()> {
             let client = connect(&cli.relays, &keys).await?;
             cmd_review_joins(&client, &keys, &ad_id).await
         }
+        Command::Challenge => cmd_challenge(),
+        Command::Vouch {
+            host_pubkey,
+            node_id,
+            zbase,
+            challenge,
+            channels,
+            capacity_sat,
+        } => {
+            let keys = load_keys(&cli.key_file)?;
+            let client = connect(&cli.relays, &keys).await?;
+            cmd_vouch(
+                &client,
+                cli.lightning_dir.as_deref(),
+                &host_pubkey,
+                &node_id,
+                &zbase,
+                &challenge,
+                channels,
+                &capacity_sat,
+            )
+            .await
+        }
+        Command::ListVouches => {
+            let keys = load_keys(&cli.key_file)?;
+            let client = connect(&cli.relays, &keys).await?;
+            cmd_list_vouches(&client).await
+        }
         Command::Seal { ad_id, members } => {
             let keys = load_keys(&cli.key_file)?;
             let client = connect(&cli.relays, &keys).await?;
@@ -211,6 +267,139 @@ async fn cmd_publish_root(client: &Client, description: &str) -> Result<()> {
     let output = client.send_event_builder(builder).await?;
     println!("root thread published");
     println!("  event id: {}", output.id());
+    Ok(())
+}
+
+fn cmd_challenge() -> Result<()> {
+    let random_bytes: [u8; 16] = rand::random();
+    let challenge = format!(
+        "soup-rendezvous-challenge:{}:{}",
+        hex::encode(random_bytes),
+        Timestamp::now().as_secs()
+    );
+    println!("challenge: {challenge}");
+    println!();
+    println!("give this to the host. they sign it with their CLN node:");
+    println!("  lightning-cli signmessage \"{challenge}\"");
+    println!();
+    println!("then run:");
+    println!("  soup-rendezvous vouch <host-npub> <node-id> <zbase> \"{challenge}\"");
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn cmd_vouch(
+    client: &Client,
+    lightning_dir: Option<&std::path::Path>,
+    host_pubkey_str: &str,
+    node_id: &str,
+    zbase: &str,
+    challenge: &str,
+    channels: u32,
+    capacity_sat: &str,
+) -> Result<()> {
+    let host_pk = if host_pubkey_str.starts_with("npub") {
+        PublicKey::from_bech32(host_pubkey_str)?
+    } else {
+        PublicKey::from_hex(host_pubkey_str)?
+    };
+
+    // Verify the signature using lightning-cli checkmessage
+    if let Some(ln_dir) = lightning_dir {
+        println!("verifying signature via lightning-cli...");
+        let output = std::process::Command::new("lightning-cli")
+            .arg(format!("--lightning-dir={}", ln_dir.display()))
+            .arg("checkmessage")
+            .arg(challenge)
+            .arg(zbase)
+            .output()
+            .context("failed to run lightning-cli checkmessage")?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            bail!("checkmessage failed: {stdout} {stderr}");
+        }
+
+        let result: serde_json::Value = serde_json::from_slice(&output.stdout)
+            .context("failed to parse checkmessage output")?;
+
+        let verified = result["verified"].as_bool().unwrap_or(false);
+        let recovered_pubkey = result["pubkey"].as_str().unwrap_or("");
+
+        if !verified {
+            bail!("signature verification failed: checkmessage returned verified=false");
+        }
+
+        if recovered_pubkey != node_id {
+            bail!(
+                "node_id mismatch: claimed {} but signature recovers to {}",
+                node_id,
+                recovered_pubkey
+            );
+        }
+
+        println!("  verified: true");
+        println!("  recovered pubkey matches claimed node_id");
+    } else {
+        println!("warning: no --lightning-dir set, skipping signature verification");
+        println!("  the operator should manually verify with:");
+        println!(
+            "  lightning-cli checkmessage \"{}\" \"{}\"",
+            challenge, zbase
+        );
+        println!("  and confirm the returned pubkey matches: {}", node_id);
+        println!();
+    }
+
+    // Publish the vouch event
+    let builder = events::build_vouch(&host_pk, node_id, channels, capacity_sat);
+    let output = client.send_event_builder(builder).await?;
+    println!("vouch published");
+    println!("  event id:    {}", output.id());
+    println!("  host nostr:  {}", host_pk);
+    println!("  ln node:     {}", node_id);
+    println!("  channels:    {}", channels);
+    println!("  capacity:    {} sat", capacity_sat);
+    Ok(())
+}
+
+async fn cmd_list_vouches(client: &Client) -> Result<()> {
+    let filter = Filter::new().kind(kinds::VOUCH);
+    let events = client.fetch_events(filter, Duration::from_secs(10)).await?;
+
+    if events.is_empty() {
+        println!("no vouches found");
+        return Ok(());
+    }
+
+    println!("found {} vouch(es):\n", events.len());
+    for ev in events.iter() {
+        let ln_node = events::get_tag_value(ev, "ln_node_id").unwrap_or_else(|| "?".into());
+        let host_p_tag = ev.tags.iter().find_map(|t| {
+            if t.kind() == TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::P)) {
+                t.content().map(|s| s.to_string())
+            } else {
+                None
+            }
+        });
+
+        println!("  vouched by: {}", ev.pubkey);
+        if let Some(hp) = host_p_tag {
+            println!("  host nostr: {hp}");
+        }
+        println!("  ln node:    {ln_node}");
+        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&ev.content) {
+            if let Some(ch) = parsed["channel_count"].as_u64() {
+                println!("  channels:   {ch}");
+            }
+            if let Some(cap) = parsed["capacity_sat"].as_str() {
+                println!("  capacity:   {cap} sat");
+            }
+        }
+        println!("  date:       {}", ev.created_at);
+        println!();
+    }
     Ok(())
 }
 
