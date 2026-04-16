@@ -2,27 +2,54 @@
 
 Coordination protocol for multi-party Bitcoin signing, built on Nostr.
 
-Users publish signed events to standard Nostr relays to find each other and form cohorts before running MuSig2, FROST, or covenant signing ceremonies elsewhere. No custom server — any Nostr relay works out of the box.
+Users publish signed events to standard Nostr relays to find each other and form cohorts before running MuSig2, FROST, or covenant signing ceremonies. No custom server — any Nostr relay works out of the box.
 
-Built for [Soup Wallet](https://github.com/8144225309/superscalar-wallet) and [SuperScalar](https://github.com/8144225309/superscalar) channel factories. Scheme-agnostic — the same event kinds work for any multi-party signing scheme.
+Built for [Soup Wallet](https://github.com/8144225309/superscalar-wallet) and [SuperScalar](https://github.com/8144225309/superscalar) channel factories. Scheme-agnostic — the same event kinds work for any multi-party signing scheme without changes.
 
 ## How it works
 
-Three Nostr event kinds form a membership ledger:
+Five Nostr event kinds handle the full lifecycle:
 
-1. **Advertisement** (kind 38100) — a host posts a cohort opening with rules and capacity
-2. **Attestation** (kind 38200) — a joiner agrees to a specific advertisement
-3. **Seal** (kind 38300) — the host closes the cohort with a manifest of accepted members
+| Kind | Name | Visibility | Purpose |
+|------|------|-----------|---------|
+| 38100 | advertisement | public | host posts a factory opening with rules and capacity |
+| 38101 | vouch | public | coordinator attests a host proved control of an LN node |
+| 38102 | status update | public | host posts slot-fill updates ("3/8 joined") |
+| 38200 | attestation | encrypted | joiner requests to join (NIP-44 encrypted to host) |
+| 38300 | seal | encrypted | host closes the cohort (NIP-44 encrypted to each member) |
 
-The seal is the handoff. After it's published, participants run their signing ceremony over whatever transport the scheme uses (for SuperScalar, that's bLIP-56 over Lightning peer messaging). Post-cohort communication between the LSP and members uses the same Nostr relays via NIP-44 encrypted DMs.
+A **coordinator** publishes a root discovery thread and vouches for factory hosts after verifying they control a real Lightning node. Wallets browse advertisements, check vouches, and join by publishing encrypted attestations. When the host seals the cohort, each member receives an encrypted manifest with the full member list and connection info. The seal is the handoff — after it, the signing ceremony runs over BOLT-8 or Nostr NIP-44 DMs, and ongoing LSP-member communication uses the same Nostr relays.
 
 ## Spam resistance
 
-Proof-of-node: wallets prove control of a Lightning node via CLN's signmessage. Spammers need to operate real LN nodes with funded channels. Legitimate users already have one.
+Proof-of-node: factory hosts prove control of a Lightning node by signing a challenge with CLN's `signmessage`. The coordinator verifies with `checkmessage` and publishes a vouch. Wallets filter unvouched advertisements by default. Spammers need to operate real LN nodes with funded channels. Legitimate hosts already have one.
+
+## CLI tool
+
+The repo includes a Rust CLI for the coordinator and for testing the full flow:
+
+```
+soup-rendezvous init              generate a Nostr keypair
+soup-rendezvous publish-root      post the root discovery thread
+soup-rendezvous test-ad <root>    post a factory advertisement
+soup-rendezvous update-status     post slot-fill status updates
+soup-rendezvous list-ads          browse factories from relays
+soup-rendezvous challenge         generate a proof-of-node challenge
+soup-rendezvous vouch             verify an LN node proof and publish a vouch
+soup-rendezvous list-vouches      list verified node proofs
+soup-rendezvous join <ad>         publish an encrypted join request
+soup-rendezvous review-joins      decrypt and review join requests (host)
+soup-rendezvous seal <ad>         seal the cohort with accepted members (host)
+soup-rendezvous show-cohort <ad>  view the full cohort state
+```
+
+## Integration
+
+See [WALLET_INTEGRATION.md](./WALLET_INTEGRATION.md) for the full protocol contract: event schemas, Nostr subscription filters, NIP-44 encryption, proof-of-node verification, seal manifest structure, rules-hash enforcement at signing time, and post-factory communication patterns.
 
 ## Status
 
-Early prototype. The repo contains a working reference server (phases 0-4, 57 tests) that validated the protocol design. Production deployments will point wallets at standard Nostr relays instead.
+Early prototype. The CLI is functional and tested live against real Nostr relays (nos.lol, relay.damus.io) with proof-of-node verification against a real CLN signet node.
 
 ## License
 
