@@ -1,5 +1,2 @@
-pub mod config;
-pub mod db;
-pub mod error;
-pub mod event;
-pub mod http;
+pub mod events;
+pub mod kinds;

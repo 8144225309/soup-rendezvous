@@ -20,6 +20,10 @@ soup-rendezvous-data/
 .env
 .envrc
 
+# Local-only design docs (never push)
+DESIGN.md
+docs/DESIGN.md
+
 # Editor / OS noise
 .DS_Store
 Thumbs.db

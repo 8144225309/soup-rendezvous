@@ -1,36 +1,21 @@
 [package]
 name = "soup-rendezvous"
-version = "0.0.1"
+version = "0.1.0"
 edition = "2024"
 license = "MIT"
-description = "Coordination server for multi-party Bitcoin signing rendezvous."
+description = "Coordination protocol for multi-party Bitcoin signing, built on Nostr."
 repository = "https://github.com/8144225309/soup-rendezvous"
 publish = false
 
 [dependencies]
+nostr-sdk = "0.44"
 tokio = { version = "1", features = ["full"] }
-axum = "0.8"
-tower = "0.5"
-tower-http = { version = "0.6", features = ["limit", "timeout", "trace"] }
-tower_governor = "0.7"
+clap = { version = "4", features = ["derive", "env"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
-thiserror = "2"
-rusqlite = { version = "0.32", features = ["bundled"] }
-r2d2 = "0.8"
-r2d2_sqlite = "0.25"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-sha2 = "0.10"
-hex = "0.4"
-chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
-clap = { version = "4", features = ["derive", "env"] }
-
-[dev-dependencies]
-tempfile = "3"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-hex = "0.4"
 
 [profile.release]
 lto = "thin"
