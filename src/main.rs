@@ -199,7 +199,10 @@ async fn main() -> Result<()> {
             let client = connect(&cli.relays, &keys).await?;
             cmd_review_joins(&client, &keys, &ad_id).await
         }
-        Command::Challenge => cmd_challenge(),
+        Command::Challenge => {
+            let keys = load_keys(&cli.key_file)?;
+            cmd_challenge(&keys)
+        }
         Command::Vouch {
             host_pubkey,
             node_id,
@@ -270,10 +273,12 @@ async fn cmd_publish_root(client: &Client, description: &str) -> Result<()> {
     Ok(())
 }
 
-fn cmd_challenge() -> Result<()> {
+fn cmd_challenge(keys: &Keys) -> Result<()> {
     let random_bytes: [u8; 16] = rand::random();
+    let coordinator_npub = keys.public_key().to_bech32()?;
     let challenge = format!(
-        "soup-rendezvous-challenge:{}:{}",
+        "soup-rendezvous:proof-of-node:v0:{}:{}:{}",
+        coordinator_npub,
         hex::encode(random_bytes),
         Timestamp::now().as_secs()
     );
@@ -281,6 +286,11 @@ fn cmd_challenge() -> Result<()> {
     println!();
     println!("give this to the host. they sign it with their CLN node:");
     println!("  lightning-cli signmessage \"{challenge}\"");
+    println!();
+    println!("IMPORTANT: the host should verify before signing:");
+    println!("  - message starts with soup-rendezvous:proof-of-node:v0:");
+    println!("  - the npub matches the coordinator they intend to vouch with");
+    println!("  - the timestamp is recent");
     println!();
     println!("then run:");
     println!("  soup-rendezvous vouch <host-npub> <node-id> <zbase> \"{challenge}\"");
@@ -303,6 +313,35 @@ async fn cmd_vouch(
     } else {
         PublicKey::from_hex(host_pubkey_str)?
     };
+
+    // Validate the challenge format to prevent cross-protocol replay
+    let coordinator_npub = client.signer().await?.get_public_key().await?.to_bech32()?;
+    let parts: Vec<&str> = challenge.split(':').collect();
+    if parts.len() != 6
+        || parts[0] != "soup-rendezvous"
+        || parts[1] != "proof-of-node"
+        || parts[2] != "v0"
+    {
+        bail!(
+            "invalid challenge format: must be soup-rendezvous:proof-of-node:v0:<npub>:<hex>:<ts>"
+        );
+    }
+    if parts[3] != coordinator_npub {
+        bail!(
+            "challenge contains wrong coordinator npub: expected {}, got {}",
+            coordinator_npub,
+            parts[3]
+        );
+    }
+    let challenge_ts: u64 = parts[5].parse().context("invalid timestamp in challenge")?;
+    let now = Timestamp::now().as_secs();
+    let skew = now.abs_diff(challenge_ts);
+    if skew > 300 {
+        bail!(
+            "challenge expired: timestamp is {} seconds old (max 300)",
+            skew
+        );
+    }
 
     // Verify the signature using lightning-cli checkmessage
     if let Some(ln_dir) = lightning_dir {
