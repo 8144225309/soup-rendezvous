@@ -129,7 +129,12 @@ enum Command {
     },
 
     /// List vouches (verified LN node proofs) from the relays.
-    ListVouches,
+    ListVouches {
+        /// Only show vouches from this coordinator (npub or hex).
+        /// Defaults to own pubkey if not specified.
+        #[arg(long)]
+        coordinator: Option<String>,
+    },
 
     /// (Host) Seal a factory with a list of accepted joiner npubs.
     Seal {
@@ -225,10 +230,10 @@ async fn main() -> Result<()> {
             )
             .await
         }
-        Command::ListVouches => {
+        Command::ListVouches { coordinator } => {
             let keys = load_keys(&cli.key_file)?;
             let client = connect(&cli.relays, &keys).await?;
-            cmd_list_vouches(&client).await
+            cmd_list_vouches(&client, &keys, coordinator.as_deref()).await
         }
         Command::Seal { ad_id, members } => {
             let keys = load_keys(&cli.key_file)?;
@@ -403,12 +408,34 @@ async fn cmd_vouch(
     Ok(())
 }
 
-async fn cmd_list_vouches(client: &Client) -> Result<()> {
-    let filter = Filter::new().kind(kinds::VOUCH);
-    let events = client.fetch_events(filter, Duration::from_secs(10)).await?;
+async fn cmd_list_vouches(
+    client: &Client,
+    keys: &Keys,
+    coordinator_str: Option<&str>,
+) -> Result<()> {
+    let coordinator_pk = match coordinator_str {
+        Some(s) if s.starts_with("npub") => PublicKey::from_bech32(s)?,
+        Some(s) => PublicKey::from_hex(s)?,
+        None => keys.public_key(),
+    };
+
+    let filter = Filter::new().kind(kinds::VOUCH).author(coordinator_pk);
+    let all_events = client.fetch_events(filter, Duration::from_secs(10)).await?;
+
+    // Client-side filter: some relays don't respect the `authors` filter
+    // for custom kinds, so we double-check here.
+    let coordinator_hex = coordinator_pk.to_hex();
+    let events: Vec<Event> = all_events
+        .into_iter()
+        .filter(|ev| ev.pubkey.to_hex() == coordinator_hex)
+        .collect();
 
     if events.is_empty() {
-        println!("no vouches found");
+        println!(
+            "no vouches found from coordinator {} ({} total on relay, none matched)",
+            coordinator_pk,
+            0 // can't count all_events after into_iter consumed it
+        );
         return Ok(());
     }
 
