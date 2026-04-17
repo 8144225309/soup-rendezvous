@@ -139,6 +139,23 @@ enum Command {
         coordinator: Option<String>,
     },
 
+    /// (Host) Accept a joiner and send them a confirmation DM.
+    Accept {
+        /// The advertisement event ID (hex).
+        ad_id: String,
+        /// The joiner's Nostr pubkey (hex or npub) to accept.
+        joiner_pubkey: String,
+        /// Slot number to assign.
+        #[arg(long)]
+        slot: u32,
+        /// Current accepted count (for status update).
+        #[arg(long)]
+        accepted: u32,
+        /// Max members (for status update).
+        #[arg(long)]
+        max_members: u32,
+    },
+
     /// (Host) Seal a factory with a list of accepted joiner npubs.
     Seal {
         /// The advertisement event ID (hex).
@@ -240,6 +257,26 @@ async fn main() -> Result<()> {
             let keys = load_keys(&cli.key_file)?;
             let client = connect(&cli.relays, &keys).await?;
             cmd_list_vouches(&client, &keys, coordinator.as_deref()).await
+        }
+        Command::Accept {
+            ad_id,
+            joiner_pubkey,
+            slot,
+            accepted,
+            max_members,
+        } => {
+            let keys = load_keys(&cli.key_file)?;
+            let client = connect(&cli.relays, &keys).await?;
+            cmd_accept(
+                &client,
+                &keys,
+                &ad_id,
+                &joiner_pubkey,
+                slot,
+                accepted,
+                max_members,
+            )
+            .await
         }
         Command::Seal { ad_id, members } => {
             let keys = load_keys(&cli.key_file)?;
@@ -821,6 +858,62 @@ async fn cmd_review_joins(client: &Client, keys: &Keys, ad_id_hex: &str) -> Resu
         println!();
     }
 
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn cmd_accept(
+    client: &Client,
+    keys: &Keys,
+    ad_id_hex: &str,
+    joiner_pubkey_str: &str,
+    slot: u32,
+    accepted: u32,
+    max_members: u32,
+) -> Result<()> {
+    let ad_id = EventId::from_hex(ad_id_hex).context("invalid ad event id hex")?;
+    let joiner_pk = if joiner_pubkey_str.starts_with("npub") {
+        PublicKey::from_bech32(joiner_pubkey_str)?
+    } else {
+        PublicKey::from_hex(joiner_pubkey_str)?
+    };
+
+    // Send encrypted acceptance DM to the joiner
+    let acceptance = serde_json::json!({
+        "type": "acceptance",
+        "advertisement_id": ad_id_hex,
+        "slot": slot,
+        "message": format!("accepted into slot {slot}, factory will seal when all slots are filled"),
+    });
+    let encrypted = nip44::encrypt(
+        keys.secret_key(),
+        &joiner_pk,
+        acceptance.to_string(),
+        nip44::Version::default(),
+    )?;
+
+    let dm_builder = EventBuilder::new(Kind::Custom(4), encrypted)
+        .tag(Tag::public_key(joiner_pk))
+        .tag(Tag::event(ad_id));
+    client.send_event_builder(dm_builder).await?;
+    println!("acceptance DM sent to {}", joiner_pk);
+
+    // Publish status update
+    let status_msg = format!("{accepted} of {max_members} slots filled");
+    let builder = events::build_status_update(
+        &ad_id,
+        "superscalar/v1",
+        if accepted >= max_members {
+            "full"
+        } else {
+            "filling"
+        },
+        accepted,
+        max_members,
+        &status_msg,
+    );
+    client.send_event_builder(builder).await?;
+    println!("status update published: {accepted}/{max_members}");
     Ok(())
 }
 
