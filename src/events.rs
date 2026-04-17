@@ -88,7 +88,8 @@ pub fn build_advertisement(
         .tag(Tag::custom(
             TagKind::custom("expiry"),
             vec![expiry_unix.to_string()],
-        ));
+        ))
+        .tag(Tag::expiration(Timestamp::from(expiry_unix)));
 
     for t in tags {
         builder = builder.tag(Tag::hashtag(*t));

@@ -78,6 +78,9 @@ enum Command {
         /// Only show ads replying to this root event ID (hex).
         #[arg(long)]
         root_id: Option<String>,
+        /// Only show ads created within this many days (default 30).
+        #[arg(long, default_value_t = 30)]
+        since_days: u64,
     },
 
     /// Join a factory (publish an encrypted attestation to the host).
@@ -179,10 +182,13 @@ async fn main() -> Result<()> {
             let client = connect(&cli.relays, &keys).await?;
             cmd_update_status(&client, &ad_id, accepted, max_members, &message).await
         }
-        Command::ListAds { root_id } => {
+        Command::ListAds {
+            root_id,
+            since_days,
+        } => {
             let keys = load_keys(&cli.key_file)?;
             let client = connect(&cli.relays, &keys).await?;
-            cmd_list_ads(&client, root_id.as_deref()).await
+            cmd_list_ads(&client, root_id.as_deref(), since_days).await
         }
         Command::Join {
             ad_id,
@@ -534,8 +540,13 @@ async fn cmd_update_status(
     Ok(())
 }
 
-async fn cmd_list_ads(client: &Client, root_id_hex: Option<&str>) -> Result<()> {
-    let mut filter = Filter::new().kind(kinds::ADVERTISEMENT);
+async fn cmd_list_ads(client: &Client, root_id_hex: Option<&str>, since_days: u64) -> Result<()> {
+    let since_ts = Timestamp::from(
+        Timestamp::now()
+            .as_secs()
+            .saturating_sub(since_days * 86400),
+    );
+    let mut filter = Filter::new().kind(kinds::ADVERTISEMENT).since(since_ts);
     if let Some(hex) = root_id_hex {
         let root_id = EventId::from_hex(hex).context("invalid root event id hex")?;
         filter = filter.event(root_id);
@@ -661,7 +672,8 @@ async fn cmd_join(
         .tag(Tag::custom(
             TagKind::custom("expiry"),
             vec![expiry.to_string()],
-        ));
+        ))
+        .tag(Tag::expiration(Timestamp::from(expiry)));
 
     let output = client.send_event_builder(builder).await?;
     println!("join request published (encrypted to host)");
