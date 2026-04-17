@@ -127,6 +127,23 @@ The wallet checks:
 
 Display: **Vouched** (green) or **Unvouched** (yellow).
 
+### Challenge format security
+
+The proof-of-node challenge uses a structured format with domain
+separation to prevent cross-protocol signature replay:
+
+```
+soup-rendezvous:proof-of-node:v0:<coordinator-npub>:<random-hex>:<unix-timestamp>
+```
+
+This ensures signatures produced for soup-rendezvous cannot be
+replayed against LNURL-auth, Amboss, or any other service that uses
+CLN signmessage. The coordinator's npub is embedded in the challenge
+so signatures can't be replayed across different coordinators.
+
+See [PROOF_OF_NODE.md](./PROOF_OF_NODE.md) for the full security
+model, validation rules, and operator checklist.
+
 ---
 
 ## 3. Joining — encrypted attestation
