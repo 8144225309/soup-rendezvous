@@ -18,7 +18,7 @@ Five Nostr event kinds handle the full lifecycle:
 | 38200 | attestation | encrypted | joiner requests to join (NIP-44 encrypted to host) |
 | 38300 | seal | encrypted | host closes the cohort (NIP-44 encrypted to each member) |
 
-A **coordinator** publishes a root discovery thread and vouches for factory hosts after verifying they control a real Lightning node. Wallets browse advertisements, check vouches, and join by publishing encrypted attestations. When the host seals the cohort, each member receives an encrypted manifest with the full member list and connection info. The seal is the handoff — after it, the signing ceremony runs over BOLT-8 or Nostr NIP-44 DMs, and ongoing LSP-member communication uses the same Nostr relays.
+A **coordinator** publishes a root discovery thread and vouches for factory hosts after verifying they control a real Lightning node. Wallets browse advertisements, check vouches, and join by publishing encrypted attestations. When the host seals the cohort, each member receives an encrypted manifest with the full member list and connection info. The seal is the handoff — after it, the wallet peers with the LSP over Lightning and all signing, state updates, and factory operations flow over the direct LN connection (custommsg 33001). Nostr is not involved after the seal.
 
 ## Spam resistance
 
@@ -39,6 +39,7 @@ soup-rendezvous vouch             verify an LN node proof and publish a vouch
 soup-rendezvous list-vouches      list verified node proofs
 soup-rendezvous join <ad>         publish an encrypted join request
 soup-rendezvous review-joins      decrypt and review join requests (host)
+soup-rendezvous accept            accept a joiner with encrypted confirmation DM (host)
 soup-rendezvous seal <ad>         seal the cohort with accepted members (host)
 soup-rendezvous show-cohort <ad>  view the full cohort state
 ```
