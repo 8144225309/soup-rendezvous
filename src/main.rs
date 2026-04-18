@@ -139,6 +139,23 @@ enum Command {
         coordinator: Option<String>,
     },
 
+    /// (Host) Send a proof-of-node request DM to a coordinator.
+    /// Constructs a challenge with the coordinator's npub, signs it with
+    /// the local CLN node, and sends the result as an encrypted DM.
+    RequestVouch {
+        /// The coordinator's Nostr pubkey (hex or npub) to request a vouch from.
+        coordinator_pubkey: String,
+        /// Path to the CLN lightning-rpc directory for signmessage.
+        #[arg(long, env = "SOUP_LIGHTNING_DIR")]
+        lightning_dir: PathBuf,
+    },
+
+    /// Run the coordinator daemon.
+    /// Subscribes for proof-of-node requests sent as NIP-44 encrypted DMs
+    /// to our pubkey, auto-verifies via lightning-cli checkmessage, and
+    /// publishes vouches on success.
+    Daemon,
+
     /// (Host) Accept a joiner and send them a confirmation DM.
     Accept {
         /// The advertisement event ID (hex).
@@ -258,6 +275,19 @@ async fn main() -> Result<()> {
             let client = connect(&cli.relays, &keys).await?;
             cmd_list_vouches(&client, &keys, coordinator.as_deref()).await
         }
+        Command::RequestVouch {
+            coordinator_pubkey,
+            lightning_dir,
+        } => {
+            let keys = load_keys(&cli.key_file)?;
+            let client = connect(&cli.relays, &keys).await?;
+            cmd_request_vouch(&client, &keys, &coordinator_pubkey, &lightning_dir).await
+        }
+        Command::Daemon => {
+            let keys = load_keys(&cli.key_file)?;
+            let client = connect(&cli.relays, &keys).await?;
+            cmd_daemon(&client, &keys, cli.lightning_dir.as_deref()).await
+        }
         Command::Accept {
             ad_id,
             joiner_pubkey,
@@ -364,32 +394,7 @@ async fn cmd_vouch(
 
     // Validate the challenge format to prevent cross-protocol replay
     let coordinator_npub = client.signer().await?.get_public_key().await?.to_bech32()?;
-    let parts: Vec<&str> = challenge.split(':').collect();
-    if parts.len() != 6
-        || parts[0] != "soup-rendezvous"
-        || parts[1] != "proof-of-node"
-        || parts[2] != "v0"
-    {
-        bail!(
-            "invalid challenge format: must be soup-rendezvous:proof-of-node:v0:<npub>:<hex>:<ts>"
-        );
-    }
-    if parts[3] != coordinator_npub {
-        bail!(
-            "challenge contains wrong coordinator npub: expected {}, got {}",
-            coordinator_npub,
-            parts[3]
-        );
-    }
-    let challenge_ts: u64 = parts[5].parse().context("invalid timestamp in challenge")?;
-    let now = Timestamp::now().as_secs();
-    let skew = now.abs_diff(challenge_ts);
-    if skew > 300 {
-        bail!(
-            "challenge expired: timestamp is {} seconds old (max 300)",
-            skew
-        );
-    }
+    validate_challenge(challenge, &coordinator_npub)?;
 
     // Verify the signature using lightning-cli checkmessage
     if let Some(ln_dir) = lightning_dir {
@@ -983,6 +988,286 @@ async fn cmd_seal(client: &Client, keys: &Keys, ad_id_hex: &str, members_csv: &s
     );
     client.send_event_builder(builder).await?;
     println!("\nfactory sealed with {} members", member_pubkeys.len());
+
+    Ok(())
+}
+
+async fn cmd_request_vouch(
+    client: &Client,
+    keys: &Keys,
+    coordinator_pubkey_str: &str,
+    lightning_dir: &std::path::Path,
+) -> Result<()> {
+    let coord_pk = if coordinator_pubkey_str.starts_with("npub") {
+        PublicKey::from_bech32(coordinator_pubkey_str)?
+    } else {
+        PublicKey::from_hex(coordinator_pubkey_str)?
+    };
+    let coord_npub = coord_pk.to_bech32()?;
+
+    // Construct challenge using the coordinator's npub
+    let random_bytes: [u8; 16] = rand::random();
+    let challenge = format!(
+        "soup-rendezvous:proof-of-node:v0:{}:{}:{}",
+        coord_npub,
+        hex::encode(random_bytes),
+        Timestamp::now().as_secs()
+    );
+
+    println!("requesting vouch from {coord_npub}");
+    println!("challenge: {challenge}");
+
+    // Sign via lightning-cli
+    let output = std::process::Command::new("lightning-cli")
+        .arg(format!("--lightning-dir={}", lightning_dir.display()))
+        .arg("signmessage")
+        .arg(&challenge)
+        .output()
+        .context("failed to run lightning-cli signmessage")?;
+    if !output.status.success() {
+        bail!(
+            "signmessage failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let sign_result: serde_json::Value =
+        serde_json::from_slice(&output.stdout).context("failed to parse signmessage output")?;
+    let zbase = sign_result["zbase"]
+        .as_str()
+        .context("no zbase in signmessage output")?;
+
+    // Get node info for channel count + capacity
+    let info_output = std::process::Command::new("lightning-cli")
+        .arg(format!("--lightning-dir={}", lightning_dir.display()))
+        .arg("getinfo")
+        .output()
+        .context("failed to run lightning-cli getinfo")?;
+    let info: serde_json::Value =
+        serde_json::from_slice(&info_output.stdout).context("failed to parse getinfo")?;
+    let node_id = info["id"].as_str().context("no id in getinfo")?;
+    let channels = info["num_active_channels"].as_u64().unwrap_or(0) as u32;
+
+    // Build the proof request JSON
+    let request = serde_json::json!({
+        "type": "proof_of_node",
+        "node_id": node_id,
+        "zbase": zbase,
+        "challenge": challenge,
+        "channels": channels,
+        "capacity_sat": "0",
+    });
+
+    // Encrypt to coordinator's pubkey
+    let encrypted = nip44::encrypt(
+        keys.secret_key(),
+        &coord_pk,
+        request.to_string(),
+        nip44::Version::default(),
+    )?;
+
+    // Send as NIP-44 DM (kind 4)
+    let dm = EventBuilder::new(Kind::Custom(4), encrypted).tag(Tag::public_key(coord_pk));
+    let dm_output = client.send_event_builder(dm).await?;
+
+    println!("proof request sent (encrypted to coordinator)");
+    println!("  event id: {}", dm_output.id());
+    println!("  node_id:  {node_id}");
+    println!("  channels: {channels}");
+    println!();
+    println!("wait for the coordinator's daemon to verify and publish a vouch.");
+    println!("check with: soup-rendezvous list-vouches --coordinator {coord_npub}");
+    Ok(())
+}
+
+async fn cmd_daemon(
+    client: &Client,
+    keys: &Keys,
+    lightning_dir: Option<&std::path::Path>,
+) -> Result<()> {
+    let coordinator_npub = keys.public_key().to_bech32()?;
+    let coordinator_pk = keys.public_key();
+
+    tracing::info!(npub = %coordinator_npub, "daemon starting");
+
+    if lightning_dir.is_none() {
+        tracing::warn!(
+            "no --lightning-dir set, proof-of-node requests will be rejected (no way to verify)"
+        );
+    }
+
+    // Subscribe for encrypted DMs (kind 4) addressed to our pubkey
+    let filter = Filter::new()
+        .kind(Kind::Custom(4))
+        .pubkey(coordinator_pk)
+        .since(Timestamp::now());
+    client.subscribe(filter, None).await?;
+    tracing::info!("subscribed for incoming proof-of-node DMs");
+
+    let client = client.clone();
+    let keys = keys.clone();
+    let ln_dir = lightning_dir.map(|p| p.to_path_buf());
+
+    client
+        .handle_notifications(|notification| {
+            let client = client.clone();
+            let keys = keys.clone();
+            let ln_dir = ln_dir.clone();
+            async move {
+                if let RelayPoolNotification::Event { event, .. } = notification
+                    && event.kind == Kind::Custom(4)
+                    && event.tags.public_keys().any(|pk| pk == &coordinator_pk)
+                    && let Err(e) =
+                        handle_proof_request(&client, &keys, ln_dir.as_deref(), &event).await
+                {
+                    tracing::warn!(sender = %event.pubkey, error = %e, "request rejected");
+                }
+                Ok(false) // continue
+            }
+        })
+        .await?;
+
+    Ok(())
+}
+
+/// Validate a proof-of-node challenge string. Returns Ok if valid,
+/// Err with a specific reason if not. Used by both cmd_vouch and
+/// the daemon's handle_proof_request.
+fn validate_challenge(challenge: &str, expected_npub: &str) -> Result<()> {
+    let parts: Vec<&str> = challenge.split(':').collect();
+    if parts.len() != 6
+        || parts[0] != "soup-rendezvous"
+        || parts[1] != "proof-of-node"
+        || parts[2] != "v0"
+    {
+        bail!(
+            "invalid challenge format: must be soup-rendezvous:proof-of-node:v0:<npub>:<hex>:<ts>"
+        );
+    }
+    if parts[3] != expected_npub {
+        bail!(
+            "challenge contains wrong coordinator npub: expected {}, got {}",
+            expected_npub,
+            parts[3]
+        );
+    }
+    let challenge_ts: u64 = parts[5].parse().context("invalid timestamp in challenge")?;
+    let now = Timestamp::now().as_secs();
+    let skew = now.abs_diff(challenge_ts);
+    if skew > 300 {
+        bail!(
+            "challenge expired: timestamp is {} seconds from now (max 300)",
+            skew
+        );
+    }
+    Ok(())
+}
+
+async fn handle_proof_request(
+    client: &Client,
+    keys: &Keys,
+    lightning_dir: Option<&std::path::Path>,
+    event: &Event,
+) -> Result<()> {
+    let sender = event.pubkey;
+
+    // Decrypt the NIP-44 DM
+    let plaintext = nip44::decrypt(keys.secret_key(), &sender, &event.content)
+        .context("failed to decrypt DM (not NIP-44 or not addressed to us)")?;
+
+    // Parse the request
+    let request: serde_json::Value =
+        serde_json::from_str(&plaintext).context("request payload is not valid json")?;
+
+    let req_type = request["type"].as_str().unwrap_or("");
+    if req_type != "proof_of_node" {
+        tracing::debug!(
+            sender = %sender,
+            req_type = %req_type,
+            "ignoring non-proof-of-node DM"
+        );
+        return Ok(());
+    }
+
+    let node_id = request["node_id"]
+        .as_str()
+        .context("missing node_id field")?;
+    let zbase = request["zbase"].as_str().context("missing zbase field")?;
+    let challenge = request["challenge"]
+        .as_str()
+        .context("missing challenge field")?;
+    let channels = request["channels"].as_u64().unwrap_or(0) as u32;
+    let capacity_sat = request["capacity_sat"].as_str().unwrap_or("0");
+
+    tracing::info!(
+        sender = %sender,
+        node_id = %node_id,
+        channels,
+        "proof-of-node request received"
+    );
+
+    // Validate the challenge
+    let coordinator_npub = keys.public_key().to_bech32()?;
+    validate_challenge(challenge, &coordinator_npub)?;
+
+    // Verify signature via lightning-cli
+    let ln_dir = lightning_dir.context("daemon running without --lightning-dir, cannot verify")?;
+    let output = std::process::Command::new("lightning-cli")
+        .arg(format!("--lightning-dir={}", ln_dir.display()))
+        .arg("checkmessage")
+        .arg(challenge)
+        .arg(zbase)
+        .output()
+        .context("failed to run lightning-cli checkmessage")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        bail!("checkmessage failed: {stdout} {stderr}");
+    }
+
+    let result: serde_json::Value =
+        serde_json::from_slice(&output.stdout).context("failed to parse checkmessage output")?;
+
+    let verified = result["verified"].as_bool().unwrap_or(false);
+    let recovered_pubkey = result["pubkey"].as_str().unwrap_or("");
+
+    if !verified {
+        bail!("signature verification failed: checkmessage returned verified=false");
+    }
+    if recovered_pubkey != node_id {
+        bail!(
+            "node_id mismatch: claimed {} but signature recovers to {}",
+            node_id,
+            recovered_pubkey
+        );
+    }
+
+    // Publish the vouch
+    let builder = events::build_vouch(&sender, node_id, channels, capacity_sat);
+    let vouch_output = client.send_event_builder(builder).await?;
+    tracing::info!(
+        sender = %sender,
+        node_id = %node_id,
+        vouch_id = %vouch_output.id(),
+        "vouch published"
+    );
+
+    // Send confirmation DM back
+    let confirmation = serde_json::json!({
+        "type": "vouch_confirmation",
+        "vouch_event_id": vouch_output.id().to_hex(),
+        "node_id": node_id,
+        "message": "vouched",
+    });
+    let encrypted = nip44::encrypt(
+        keys.secret_key(),
+        &sender,
+        confirmation.to_string(),
+        nip44::Version::default(),
+    )?;
+    let dm = EventBuilder::new(Kind::Custom(4), encrypted).tag(Tag::public_key(sender));
+    client.send_event_builder(dm).await?;
+    tracing::info!(sender = %sender, "confirmation DM sent");
 
     Ok(())
 }
