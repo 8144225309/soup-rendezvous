@@ -4,6 +4,9 @@
 
 set -euo pipefail
 
+# Ensure cargo is in PATH even when invoked by systemd/cron
+export PATH="${HOME:-/root}/.cargo/bin:${PATH:-/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin}"
+
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BINARY="/usr/local/bin/soup-rendezvous"
 STATE_DIR="/var/lib/soup-rendezvous"

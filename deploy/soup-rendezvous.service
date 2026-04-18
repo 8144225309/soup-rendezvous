@@ -3,6 +3,8 @@ Description=soup-rendezvous coordinator daemon
 Documentation=https://github.com/8144225309/soup-rendezvous
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=600
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -17,8 +19,6 @@ Environment=RUST_LOG=soup_rendezvous=info,nostr_relay_pool=warn
 
 Restart=on-failure
 RestartSec=10
-StartLimitIntervalSec=600
-StartLimitBurst=5
 
 # Journald log identifier
 SyslogIdentifier=soup-rendezvous
