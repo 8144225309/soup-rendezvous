@@ -1079,6 +1079,97 @@ async fn cmd_request_vouch(
     Ok(())
 }
 
+/// Rate limiter and replay cache for the daemon.
+/// All state is in-memory; cleared on restart. For our scale
+/// (a handful of requests per day) this is plenty.
+#[derive(Default)]
+struct DaemonState {
+    /// Per-sender request timestamps (for rate limiting)
+    per_sender: std::collections::HashMap<PublicKey, Vec<u64>>,
+    /// Global request timestamps across all senders
+    global: Vec<u64>,
+    /// Seen (pubkey, challenge_hash) to reject replays
+    seen: std::collections::HashSet<[u8; 32]>,
+    /// Oldest-first queue of seen entries with timestamps, for eviction
+    seen_order: std::collections::VecDeque<(u64, [u8; 32])>,
+}
+
+const PER_SENDER_HOURLY: usize = 5;
+const PER_SENDER_MINUTELY: usize = 1;
+const GLOBAL_HOURLY: usize = 100;
+const REPLAY_TTL_SECS: u64 = 600; // 10 minutes
+
+impl DaemonState {
+    /// Check rate limits for a sender. Returns Err with a reason if
+    /// rate-limited, Ok if the request should proceed. On Ok, records
+    /// the timestamp so subsequent checks count it.
+    fn check_rate(&mut self, sender: &PublicKey) -> Result<()> {
+        let now = Timestamp::now().as_secs();
+
+        // Evict old per-sender entries (> 1 hour)
+        let entry = self.per_sender.entry(*sender).or_default();
+        entry.retain(|&ts| now.saturating_sub(ts) < 3600);
+
+        // Burst: max 1 request per minute from the same sender
+        let recent = entry
+            .iter()
+            .filter(|&&ts| now.saturating_sub(ts) < 60)
+            .count();
+        if recent >= PER_SENDER_MINUTELY {
+            bail!("rate limited: sender sent a request in the last minute");
+        }
+
+        // Hourly per-sender cap
+        if entry.len() >= PER_SENDER_HOURLY {
+            bail!("rate limited: sender exceeded {PER_SENDER_HOURLY} requests/hour");
+        }
+
+        // Global cap
+        self.global.retain(|&ts| now.saturating_sub(ts) < 3600);
+        if self.global.len() >= GLOBAL_HOURLY {
+            bail!("rate limited: global cap of {GLOBAL_HOURLY} requests/hour reached");
+        }
+
+        // Record
+        entry.push(now);
+        self.global.push(now);
+        Ok(())
+    }
+
+    /// Check whether we've seen this (sender, challenge) combination.
+    /// Returns Err if seen (replay), Ok and records it if new.
+    fn check_replay(&mut self, sender: &PublicKey, challenge: &str) -> Result<()> {
+        let now = Timestamp::now().as_secs();
+
+        // Evict expired entries
+        while let Some(&(ts, _)) = self.seen_order.front() {
+            if now.saturating_sub(ts) >= REPLAY_TTL_SECS {
+                if let Some((_, h)) = self.seen_order.pop_front() {
+                    self.seen.remove(&h);
+                }
+            } else {
+                break;
+            }
+        }
+
+        // Compute hash
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(sender.to_hex().as_bytes());
+        h.update(b":");
+        h.update(challenge.as_bytes());
+        let hash: [u8; 32] = h.finalize().into();
+
+        if self.seen.contains(&hash) {
+            bail!("replay: same (sender, challenge) seen within {REPLAY_TTL_SECS}s");
+        }
+
+        self.seen.insert(hash);
+        self.seen_order.push_back((now, hash));
+        Ok(())
+    }
+}
+
 async fn cmd_daemon(
     client: &Client,
     keys: &Keys,
@@ -1106,18 +1197,21 @@ async fn cmd_daemon(
     let client = client.clone();
     let keys = keys.clone();
     let ln_dir = lightning_dir.map(|p| p.to_path_buf());
+    let state = std::sync::Arc::new(std::sync::Mutex::new(DaemonState::default()));
 
     client
         .handle_notifications(|notification| {
             let client = client.clone();
             let keys = keys.clone();
             let ln_dir = ln_dir.clone();
+            let state = state.clone();
             async move {
                 if let RelayPoolNotification::Event { event, .. } = notification
                     && event.kind == Kind::Custom(4)
                     && event.tags.public_keys().any(|pk| pk == &coordinator_pk)
                     && let Err(e) =
-                        handle_proof_request(&client, &keys, ln_dir.as_deref(), &event).await
+                        handle_proof_request(&client, &keys, ln_dir.as_deref(), &event, &state)
+                            .await
                 {
                     tracing::warn!(sender = %event.pubkey, error = %e, "request rejected");
                 }
@@ -1167,6 +1261,7 @@ async fn handle_proof_request(
     keys: &Keys,
     lightning_dir: Option<&std::path::Path>,
     event: &Event,
+    state: &std::sync::Arc<std::sync::Mutex<DaemonState>>,
 ) -> Result<()> {
     let sender = event.pubkey;
 
@@ -1186,6 +1281,12 @@ async fn handle_proof_request(
             "ignoring non-proof-of-node DM"
         );
         return Ok(());
+    }
+
+    // Rate limit check (before doing any expensive crypto work)
+    {
+        let mut s = state.lock().expect("state mutex poisoned");
+        s.check_rate(&sender)?;
     }
 
     let node_id = request["node_id"]
@@ -1208,6 +1309,12 @@ async fn handle_proof_request(
     // Validate the challenge
     let coordinator_npub = keys.public_key().to_bech32()?;
     validate_challenge(challenge, &coordinator_npub)?;
+
+    // Replay check (same sender + challenge within 10 min => drop)
+    {
+        let mut s = state.lock().expect("state mutex poisoned");
+        s.check_replay(&sender, challenge)?;
+    }
 
     // Verify signature via lightning-cli
     let ln_dir = lightning_dir.context("daemon running without --lightning-dir, cannot verify")?;
