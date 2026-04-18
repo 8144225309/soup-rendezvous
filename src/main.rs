@@ -1079,7 +1079,7 @@ async fn cmd_request_vouch(
     Ok(())
 }
 
-/// Rate limiter and replay cache for the daemon.
+/// Rate limiter, replay cache, and observability counters for the daemon.
 /// All state is in-memory; cleared on restart. For our scale
 /// (a handful of requests per day) this is plenty.
 #[derive(Default)]
@@ -1092,6 +1092,35 @@ struct DaemonState {
     seen: std::collections::HashSet<[u8; 32]>,
     /// Oldest-first queue of seen entries with timestamps, for eviction
     seen_order: std::collections::VecDeque<(u64, [u8; 32])>,
+
+    // Observability counters (monotonic since daemon start)
+    proofs_received: u64,
+    proofs_verified: u64,
+    proofs_rejected_format: u64,
+    proofs_rejected_signature: u64,
+    proofs_rate_limited: u64,
+    proofs_replayed: u64,
+    vouches_published: u64,
+    dms_decrypt_failed: u64,
+}
+
+impl DaemonState {
+    /// Render current counters as a single log-friendly string.
+    fn metrics_summary(&self) -> String {
+        format!(
+            "metrics: received={} verified={} vouches={} rejected_format={} rejected_sig={} rate_limited={} replayed={} decrypt_failed={} seen_cache={} tracked_senders={}",
+            self.proofs_received,
+            self.proofs_verified,
+            self.vouches_published,
+            self.proofs_rejected_format,
+            self.proofs_rejected_signature,
+            self.proofs_rate_limited,
+            self.proofs_replayed,
+            self.dms_decrypt_failed,
+            self.seen.len(),
+            self.per_sender.len(),
+        )
+    }
 }
 
 const PER_SENDER_HOURLY: usize = 5;
@@ -1199,6 +1228,23 @@ async fn cmd_daemon(
     let ln_dir = lightning_dir.map(|p| p.to_path_buf());
     let state = std::sync::Arc::new(std::sync::Mutex::new(DaemonState::default()));
 
+    // Spawn periodic metrics logger (every 60s)
+    {
+        let state = state.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(60));
+            ticker.tick().await; // skip the immediate first tick
+            loop {
+                ticker.tick().await;
+                let summary = state
+                    .lock()
+                    .expect("state mutex poisoned")
+                    .metrics_summary();
+                tracing::info!("{summary}");
+            }
+        });
+    }
+
     client
         .handle_notifications(|notification| {
             let client = client.clone();
@@ -1266,8 +1312,19 @@ async fn handle_proof_request(
     let sender = event.pubkey;
 
     // Decrypt the NIP-44 DM
-    let plaintext = nip44::decrypt(keys.secret_key(), &sender, &event.content)
-        .context("failed to decrypt DM (not NIP-44 or not addressed to us)")?;
+    let plaintext = match nip44::decrypt(keys.secret_key(), &sender, &event.content) {
+        Ok(p) => p,
+        Err(e) => {
+            state
+                .lock()
+                .expect("state mutex poisoned")
+                .dms_decrypt_failed += 1;
+            return Err(anyhow::anyhow!(
+                "failed to decrypt DM (not NIP-44 or not addressed to us): {}",
+                e
+            ));
+        }
+    };
 
     // Parse the request
     let request: serde_json::Value =
@@ -1283,10 +1340,19 @@ async fn handle_proof_request(
         return Ok(());
     }
 
+    // From this point we know it's a proof_of_node request.
+    {
+        let mut s = state.lock().expect("state mutex poisoned");
+        s.proofs_received += 1;
+    }
+
     // Rate limit check (before doing any expensive crypto work)
     {
         let mut s = state.lock().expect("state mutex poisoned");
-        s.check_rate(&sender)?;
+        if let Err(e) = s.check_rate(&sender) {
+            s.proofs_rate_limited += 1;
+            return Err(e);
+        }
     }
 
     let node_id = request["node_id"]
@@ -1308,12 +1374,21 @@ async fn handle_proof_request(
 
     // Validate the challenge
     let coordinator_npub = keys.public_key().to_bech32()?;
-    validate_challenge(challenge, &coordinator_npub)?;
+    if let Err(e) = validate_challenge(challenge, &coordinator_npub) {
+        state
+            .lock()
+            .expect("state mutex poisoned")
+            .proofs_rejected_format += 1;
+        return Err(e);
+    }
 
     // Replay check (same sender + challenge within 10 min => drop)
     {
         let mut s = state.lock().expect("state mutex poisoned");
-        s.check_replay(&sender, challenge)?;
+        if let Err(e) = s.check_replay(&sender, challenge) {
+            s.proofs_replayed += 1;
+            return Err(e);
+        }
     }
 
     // Verify signature via lightning-cli
@@ -1339,9 +1414,17 @@ async fn handle_proof_request(
     let recovered_pubkey = result["pubkey"].as_str().unwrap_or("");
 
     if !verified {
+        state
+            .lock()
+            .expect("state mutex poisoned")
+            .proofs_rejected_signature += 1;
         bail!("signature verification failed: checkmessage returned verified=false");
     }
     if recovered_pubkey != node_id {
+        state
+            .lock()
+            .expect("state mutex poisoned")
+            .proofs_rejected_signature += 1;
         bail!(
             "node_id mismatch: claimed {} but signature recovers to {}",
             node_id,
@@ -1349,9 +1432,15 @@ async fn handle_proof_request(
         );
     }
 
+    state.lock().expect("state mutex poisoned").proofs_verified += 1;
+
     // Publish the vouch
     let builder = events::build_vouch(&sender, node_id, channels, capacity_sat);
     let vouch_output = client.send_event_builder(builder).await?;
+    state
+        .lock()
+        .expect("state mutex poisoned")
+        .vouches_published += 1;
     tracing::info!(
         sender = %sender,
         node_id = %node_id,
