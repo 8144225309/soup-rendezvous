@@ -23,6 +23,8 @@ soup-rendezvous-data/
 # Local-only design docs (never push)
 DESIGN.md
 docs/DESIGN.md
+docs/PRODUCTION_PLAN.md
+PRODUCTION_PLAN.md
 
 # Editor / OS noise
 .DS_Store
