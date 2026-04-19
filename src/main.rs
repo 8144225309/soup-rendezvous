@@ -571,6 +571,7 @@ async fn main() -> Result<()> {
             cmd_daemon(
                 &client,
                 &keys,
+                &cli.key_file,
                 cli.lightning_dir.as_deref(),
                 cli.bitcoin_dir.as_deref(),
                 cli.min_utxo_balance_sat,
@@ -1811,6 +1812,16 @@ struct DaemonState {
     proofs_replayed: u64,
     vouches_published: u64,
     dms_decrypt_failed: u64,
+
+    /// Max `created_at` of any kind-4 DM we've pulled off relays this
+    /// session. Persisted to `last_seen_dm.txt` next to the key file so
+    /// that across daemon restarts we subscribe with `.since(last_seen)`
+    /// and pick up DMs that arrived while we were offline.
+    last_seen_created_at: u64,
+    /// Backlog size logged once at startup: number of events the
+    /// notification handler dispatched with `created_at <= startup_now`.
+    /// Purely observational.
+    backlog_processed: u64,
 }
 
 /// One active vouch in the in-memory table. `identifier` is the
@@ -1861,7 +1872,7 @@ impl DaemonState {
     /// Render current counters as a single log-friendly string.
     fn metrics_summary(&self) -> String {
         format!(
-            "metrics: received={} verified={} vouches={} rejected_format={} rejected_sig={} rejected_cap={} rate_limited={} replayed={} decrypt_failed={} seen_cache={} tracked_senders={} vouch_table_size={} vouch_table_last_synced_at={} bucket_chain_anchored={}/{} bucket_peer={}/{}",
+            "metrics: received={} verified={} vouches={} rejected_format={} rejected_sig={} rejected_cap={} rate_limited={} replayed={} decrypt_failed={} seen_cache={} tracked_senders={} vouch_table_size={} vouch_table_last_synced_at={} bucket_chain_anchored={}/{} bucket_peer={}/{} last_seen_dm={} backlog_processed={}",
             self.proofs_received,
             self.proofs_verified,
             self.vouches_published,
@@ -1879,6 +1890,8 @@ impl DaemonState {
             GLOBAL_CHAIN_ANCHORED_HOURLY,
             self.global_peer.len(),
             GLOBAL_PEER_HOURLY,
+            self.last_seen_created_at,
+            self.backlog_processed,
         )
     }
 
@@ -2035,6 +2048,7 @@ impl DaemonState {
 async fn cmd_daemon(
     client: &Client,
     keys: &Keys,
+    key_file: &std::path::Path,
     lightning_dir: Option<&std::path::Path>,
     bitcoin_dir: Option<&std::path::Path>,
     min_utxo_balance_sat: u64,
@@ -2068,19 +2082,61 @@ async fn cmd_daemon(
         );
     }
 
-    // Subscribe for encrypted DMs (kind 4) addressed to our pubkey
+    // Resume from the last DM timestamp we persisted (if any) so a
+    // restart picks up requests that arrived while we were down.
+    // Re-processing an already-handled DM is benign: the 5-min challenge
+    // freshness window rejects stale ones, replayed ones are idempotent
+    // (same parameterized-replaceable d-tag), and the vouch table's
+    // cap check uses our own authoritative publishes.
+    let last_seen_path = last_seen_dm_path(key_file);
+    let startup_now = Timestamp::now().as_secs();
+    let since_ts = match last_seen_path
+        .as_ref()
+        .and_then(|p| load_last_seen_dm(p).map(|ts| (p, ts)))
+    {
+        Some((path, ts)) => {
+            let gap_secs = startup_now.saturating_sub(ts);
+            tracing::info!(
+                last_seen_ts = ts,
+                gap_seconds = gap_secs,
+                path = %path.display(),
+                "resuming DM scan from persisted last_seen_dm; backlog from this window will be replayed"
+            );
+            ts
+        }
+        None => {
+            if let Some(p) = last_seen_path.as_ref() {
+                tracing::info!(
+                    path = %p.display(),
+                    "no prior last_seen_dm found; starting from now (fresh state)"
+                );
+            } else {
+                tracing::warn!(
+                    "key_file has no parent dir; cannot persist last_seen_dm — backlog on restart will be lost"
+                );
+            }
+            startup_now
+        }
+    };
+
     let filter = Filter::new()
         .kind(Kind::Custom(4))
         .pubkey(coordinator_pk)
-        .since(Timestamp::now());
+        .since(Timestamp::from(since_ts));
     client.subscribe(filter, None).await?;
-    tracing::info!("subscribed for incoming proof-of-channel DMs");
+    tracing::info!(
+        since_ts,
+        "subscribed for incoming DMs (channel/utxo/peer/multi)"
+    );
 
     let client = client.clone();
     let keys = keys.clone();
     let ln_dir = lightning_dir.map(|p| p.to_path_buf());
     let btc_dir = bitcoin_dir.map(|p| p.to_path_buf());
-    let state = std::sync::Arc::new(std::sync::Mutex::new(DaemonState::default()));
+    let state = std::sync::Arc::new(std::sync::Mutex::new(DaemonState {
+        last_seen_created_at: since_ts,
+        ..DaemonState::default()
+    }));
 
     // Initial sync of the in-memory vouch table from relays. Retries
     // every 30s on failure so a transient relay issue doesn't leave
@@ -2148,11 +2204,25 @@ async fn cmd_daemon(
             let ln_dir = ln_dir.clone();
             let btc_dir = btc_dir.clone();
             let state = state.clone();
+            let last_seen_path = last_seen_path.clone();
             async move {
                 if let RelayPoolNotification::Event { event, .. } = notification
                     && event.kind == Kind::Custom(4)
                     && event.tags.public_keys().any(|pk| pk == &coordinator_pk)
-                    && let Err(e) = handle_proof_request(
+                {
+                    let event_ts = event.created_at.as_secs();
+                    let is_backlog = event_ts < startup_now;
+                    if is_backlog {
+                        let age = startup_now.saturating_sub(event_ts);
+                        tracing::info!(
+                            sender = %event.pubkey,
+                            event_ts,
+                            age_seconds = age,
+                            "backlog DM replayed from offline window (will be processed; may reject as stale if challenge ts is outside 5-min window)"
+                        );
+                    }
+
+                    if let Err(e) = handle_proof_request(
                         &client,
                         &keys,
                         ln_dir.as_deref(),
@@ -2166,8 +2236,29 @@ async fn cmd_daemon(
                         max_active_vouches_per_ln_node,
                     )
                     .await
-                {
-                    tracing::warn!(sender = %event.pubkey, error = %e, "request rejected");
+                    {
+                        tracing::warn!(sender = %event.pubkey, error = %e, "request rejected");
+                    }
+
+                    // Advance the persisted high-water mark whether the
+                    // request succeeded or failed — we've observed this
+                    // DM either way, and we don't want to re-process it
+                    // on the next restart.
+                    let persist = {
+                        let mut s = state.lock().expect("state mutex poisoned");
+                        if event_ts > s.last_seen_created_at {
+                            s.last_seen_created_at = event_ts;
+                            if is_backlog {
+                                s.backlog_processed += 1;
+                            }
+                            Some(event_ts)
+                        } else {
+                            None
+                        }
+                    };
+                    if let (Some(ts), Some(path)) = (persist, &last_seen_path) {
+                        save_last_seen_dm(path, ts);
+                    }
                 }
                 Ok(false) // continue
             }
@@ -2175,6 +2266,29 @@ async fn cmd_daemon(
         .await?;
 
     Ok(())
+}
+
+/// Path where the daemon persists the most recent DM `created_at` it
+/// has observed, so that after a restart it resumes the subscription
+/// with `.since(last_seen)` and replays the offline backlog. Sits next
+/// to the key file because that directory is already writable by the
+/// daemon under our systemd config.
+fn last_seen_dm_path(key_file: &std::path::Path) -> Option<std::path::PathBuf> {
+    key_file.parent().map(|p| p.join("last_seen_dm.txt"))
+}
+
+fn load_last_seen_dm(path: &std::path::Path) -> Option<u64> {
+    std::fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
+fn save_last_seen_dm(path: &std::path::Path, ts: u64) {
+    if let Err(e) = std::fs::write(path, ts.to_string()) {
+        tracing::warn!(
+            error = %e,
+            path = %path.display(),
+            "failed to persist last_seen_dm; offline-backlog resume after next restart may miss events"
+        );
+    }
 }
 
 /// Validate a proof-of-channel challenge string. Returns Ok if valid,
