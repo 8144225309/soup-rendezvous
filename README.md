@@ -106,6 +106,8 @@ Wallets filter unvouched advertisements by default. For chain-anchored tiers, sp
 
 **Young-peer safety: use multi-method DMs.** A freshly-funded LN channel won't be in the coordinator's BOLT-7 gossip view for minutes to hours after the funding transaction confirms. Any host that can produce more than one proof method SHOULD always send a `proof_multi` DM (see [WALLET_INTEGRATION.md §7.1a](./WALLET_INTEGRATION.md)) rather than single-method. The coordinator tries each proof in order and publishes at the first tier that verifies — so a new operator who just opened their first channel still gets vouched immediately via the UTXO fallback while gossip catches up. No back-and-forth required, no legitimate operator filtered out for being correct-and-fast.
 
+**How verification cascades and how wallets filter.** The coordinator only verifies what the host submits. With `proof_multi`, it tries each submitted proof in order and publishes **one vouch at the first tier that verifies**. A host therefore holds at most one active vouch per coordinator (d-tag = host pubkey hex), labeled with the tier that won. Because the tier label is a NIP-01 single-letter `l` tag, wallets filter tier-first at the relay layer: query `"#l":["channel"]` first, then `"#l":["utxo"]`, and `"#l":["peer"]` only behind an explicit opt-in. A flood at peer-tier cannot pollute a channel-tier query. See [WALLET_INTEGRATION.md §2](./WALLET_INTEGRATION.md) for the recommended discovery sequence, the per-tier field reference, and the note on the utxo-tier LN-contact gap.
+
 ## CLI tool
 
 The repo includes a Rust CLI for the coordinator and for testing the full flow:

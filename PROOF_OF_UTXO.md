@@ -90,6 +90,10 @@ The encrypted DM carries:
 
 `utxo_txid` and `utxo_vout` specify exactly which unspent output the host is using as proof. The coordinator uses these to query bitcoind directly — no wallet import or `scantxoutset` is required; `gettxout` reads the UTXO set in milliseconds.
 
+### What the utxo-tier vouch does NOT carry
+
+The published vouch carries `btc_address`, `verified_balance_sat`, and the UTXO outpoint — everything a wallet needs to cross-check the coordinator's claim via `gettxout` and to apply its own balance floor. It does **not** carry an `ln_node_id`, because at this tier the coordinator has not verified anything about the host's Lightning node. Wallets that need LN contact information for a utxo-tier host obtain it from the host's kind-38100 factory advertisement (which carries `lsp_pubkey`), not from the vouch. See [WALLET_INTEGRATION.md §2 — Vouch field reference](./WALLET_INTEGRATION.md) for the full per-tier field table.
+
 ## Coordinator checks
 
 In order (cheap checks first):
