@@ -20,88 +20,6 @@ fn root_thread_has_correct_kind_and_d_tag() {
     assert_eq!(event.content, "test root");
 }
 
-#[test]
-fn advertisement_has_correct_tags() {
-    let keys = Keys::generate();
-    let root_id = EventId::from_slice(&[0xaa; 32]).unwrap();
-
-    let builder = events::build_advertisement(
-        &root_id,
-        "my-factory",
-        "superscalar/v1",
-        4,
-        8,
-        &["europe", "evening"],
-        1776000000,
-        "{\"test\": true}",
-    );
-    let event = builder.sign_with_keys(&keys).unwrap();
-
-    assert_eq!(event.kind, kinds::ADVERTISEMENT);
-    assert_eq!(events::get_d_tag(&event).as_deref(), Some("my-factory"));
-    assert_eq!(
-        events::get_tag_value(&event, "scheme").as_deref(),
-        Some("superscalar/v1")
-    );
-    assert_eq!(
-        events::get_tag_value(&event, "min_members").as_deref(),
-        Some("4")
-    );
-    assert_eq!(
-        events::get_tag_value(&event, "max_members").as_deref(),
-        Some("8")
-    );
-    assert_eq!(
-        events::get_tag_value(&event, "slots").as_deref(),
-        Some("0/8")
-    );
-    assert_eq!(
-        events::get_tag_value(&event, "expiry").as_deref(),
-        Some("1776000000")
-    );
-
-    // Check e-tag references root
-    let e_tag = events::get_e_tag(&event);
-    assert_eq!(e_tag, Some(root_id));
-
-    // Check hashtags
-    let hashtags: Vec<String> = event
-        .tags
-        .iter()
-        .filter(|t| t.kind() == TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::T)))
-        .filter_map(|t| t.content().map(|s| s.to_string()))
-        .collect();
-    assert!(hashtags.contains(&"europe".to_string()));
-    assert!(hashtags.contains(&"evening".to_string()));
-
-    // Check NIP-40 expiration tag exists
-    let has_expiration = event.tags.iter().any(|t| t.kind() == TagKind::Expiration);
-    assert!(has_expiration);
-
-    // Content preserved
-    assert_eq!(event.content, "{\"test\": true}");
-}
-
-#[test]
-fn status_update_has_correct_tags() {
-    let keys = Keys::generate();
-    let ad_id = EventId::from_slice(&[0xbb; 32]).unwrap();
-
-    let builder = events::build_status_update(&ad_id, "superscalar/v1", "filling", 3, 8, "3 of 8");
-    let event = builder.sign_with_keys(&keys).unwrap();
-
-    assert_eq!(event.kind, kinds::STATUS_UPDATE);
-    assert_eq!(
-        events::get_tag_value(&event, "status").as_deref(),
-        Some("filling")
-    );
-    assert_eq!(
-        events::get_tag_value(&event, "slots").as_deref(),
-        Some("3/8")
-    );
-    assert_eq!(events::get_e_tag(&event), Some(ad_id));
-}
-
 // Helper: extract the `["l", ...]` tag value from a vouch.
 fn l_tag(ev: &Event) -> Option<String> {
     ev.tags.iter().find_map(|t| {
@@ -317,112 +235,35 @@ fn revoke_vouch_shares_d_tag_and_marks_revoked() {
     assert!(parsed.get("reason").is_none());
 }
 
-// --- NIP-44 encryption round-trip ---
+// --- NIP-44 encryption round-trip (proof DM envelope) ---
 
 #[test]
-fn attestation_payload_encrypts_and_decrypts() {
-    let joiner_keys = Keys::generate();
+fn nip44_round_trip_for_proof_dm() {
+    // The only encrypted payloads left in the protocol are proof-request
+    // DMs (host → coordinator) and vouch-confirmation DMs (coordinator →
+    // host). Both ride NIP-44; this test covers the encrypt/decrypt
+    // primitive we depend on for either direction.
     let host_keys = Keys::generate();
+    let coord_keys = Keys::generate();
 
-    let payload = events::AttestationPayload {
-        joiner_cln_pubkey: "03deadbeef".into(),
-        joiner_cln_endpoint: "127.0.0.1:9735".into(),
-        joiner_nostr_relays: vec!["wss://relay.example".into()],
-        nonce: "abc123".into(),
-        message: "I want to join".into(),
-    };
-    let json = serde_json::to_string(&payload).unwrap();
+    let plaintext = r#"{"type":"proof_of_channel","node_id":"03abc","zbase":"d9rzo","challenge":"soup-rendezvous:proof-of-channel:v0:npub..."}"#;
 
-    // Joiner encrypts to host
     let encrypted = nip44::encrypt(
-        joiner_keys.secret_key(),
-        &host_keys.public_key(),
-        &json,
+        host_keys.secret_key(),
+        &coord_keys.public_key(),
+        plaintext,
         nip44::Version::default(),
     )
     .unwrap();
+    assert_ne!(encrypted, plaintext);
 
-    assert_ne!(encrypted, json); // actually encrypted
-
-    // Host decrypts
     let decrypted = nip44::decrypt(
-        host_keys.secret_key(),
-        &joiner_keys.public_key(),
-        &encrypted,
-    )
-    .unwrap();
-
-    let recovered: events::AttestationPayload = serde_json::from_str(&decrypted).unwrap();
-    assert_eq!(recovered.joiner_cln_pubkey, "03deadbeef");
-    assert_eq!(recovered.message, "I want to join");
-}
-
-#[test]
-fn seal_manifest_encrypts_and_decrypts() {
-    let host_keys = Keys::generate();
-    let member_keys = Keys::generate();
-
-    let manifest = events::SealManifest {
-        advertisement_id: "abc123".into(),
-        rules_hash: "def456".into(),
-        members: vec![events::SealMember {
-            nostr_pubkey: member_keys.public_key().to_hex(),
-            cln_pubkey: "03aabb".into(),
-            cln_endpoint: "host:9735".into(),
-            slot: 0,
-        }],
-        sealed_at: 1776000000,
-    };
-    let json = serde_json::to_string(&manifest).unwrap();
-
-    // Host encrypts to member
-    let encrypted = nip44::encrypt(
-        host_keys.secret_key(),
-        &member_keys.public_key(),
-        &json,
-        nip44::Version::default(),
-    )
-    .unwrap();
-
-    // Member decrypts
-    let decrypted = nip44::decrypt(
-        member_keys.secret_key(),
+        coord_keys.secret_key(),
         &host_keys.public_key(),
         &encrypted,
     )
     .unwrap();
-
-    let recovered: events::SealManifest = serde_json::from_str(&decrypted).unwrap();
-    assert_eq!(recovered.advertisement_id, "abc123");
-    assert_eq!(recovered.members.len(), 1);
-    assert_eq!(recovered.members[0].slot, 0);
-    assert_eq!(recovered.members[0].cln_pubkey, "03aabb");
-}
-
-// --- Payload serialization ---
-
-#[test]
-fn superscalar_payload_round_trips() {
-    let payload = events::SuperScalarPayload {
-        lsp_pubkey: "02abc".into(),
-        lsp_endpoints: vec!["host:9735".into()],
-        lsp_nostr_relays: vec!["wss://relay.example".into()],
-        total_funding_sat: "10000000".into(),
-        client_contribution_sat: "1000000".into(),
-        lsp_liquidity_sat: "2000000".into(),
-        leaf_arity: 2,
-        epoch_count: 30,
-        lifetime_blocks: 4320,
-        dying_period_blocks: 432,
-        lsp_fee_sat: "5000".into(),
-        lsp_fee_ppm: 1000,
-    };
-
-    let json = serde_json::to_string(&payload).unwrap();
-    let recovered: events::SuperScalarPayload = serde_json::from_str(&json).unwrap();
-    assert_eq!(recovered.total_funding_sat, "10000000");
-    assert_eq!(recovered.leaf_arity, 2);
-    assert_eq!(recovered.lsp_fee_ppm, 1000);
+    assert_eq!(decrypted, plaintext);
 }
 
 // --- Tag extraction helpers ---

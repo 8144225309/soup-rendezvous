@@ -18,7 +18,7 @@ Channel and UTXO are both chain-anchored and co-equal in trust. Use proof-of-utx
 
 Proof-of-UTXO has a second use case beyond "operator without any LN node": it's the natural **fallback for a host whose LN channel is real but too young for the coordinator's gossip view**. BOLT-7 gossip propagation is eventually-consistent and takes minutes-to-hours; a channel opened 5 minutes ago will produce a valid `signmessage` but will fail `checkmessage` because the coordinator hasn't heard the `channel_announcement` yet.
 
-A host in this situation should include a proof-of-UTXO proof **alongside** their proof-of-channel in a multi-method DM (see [WALLET_INTEGRATION.md §7.1a and §7.1b](./WALLET_INTEGRATION.md)). The coordinator:
+A host in this situation should include a proof-of-UTXO proof **alongside** their proof-of-channel in a multi-method DM (see [WALLET_INTEGRATION.md §9](./WALLET_INTEGRATION.md)). The coordinator:
 1. Tries channel first → fails due to gossip gap.
 2. Falls through to utxo → succeeds immediately.
 3. Publishes a utxo-tier vouch — the host is live.
@@ -98,7 +98,7 @@ The encrypted DM carries:
 
 The published vouch carries only the unified contact-pointer fields: `ln_node_id`, optional `ln_addresses`, status, expiration, and a daemon-internal `["btc_hash", ...]` tag (12-byte SHA-256 of the verified bitcoin address) used by the coordinator to rebuild per-address Sybil cap state on restart. Wallets ignore `btc_hash`.
 
-The `btc_address`, `utxo_txid`, `utxo_vout`, and `verified_balance_sat` are deliberately stripped from the published event so vouches don't expose host-side bitcoin addresses, UTXO outpoints, or balances. Wallets cannot independently call `gettxout` to cross-check the coordinator's chain-anchor claim — they're trusting the coordinator's signature for that. See [WALLET_INTEGRATION.md §2 — Trust model and the chain-anchor trade](./WALLET_INTEGRATION.md) for the full discussion.
+The `btc_address`, `utxo_txid`, `utxo_vout`, and `verified_balance_sat` are deliberately stripped from the published event so vouches don't expose host-side bitcoin addresses, UTXO outpoints, or balances. Wallets that want a stronger Sybil floor than any given coordinator's configured `min_utxo_balance_sat` should run their own coordinator or subscribe to one whose floor matches their threshold. Nothing in this layer ever puts wallet funds at risk — the worst case from a misbehaving coordinator is a wasted LN dial.
 
 ## Coordinator checks
 
