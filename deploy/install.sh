@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
-# soup-rendezvous installer.
+# soup-rendezvous installer — builds the binary, installs the systemd
+# template unit, and prepares the example config. Per-network state
+# directories and nsecs are left for the operator to create (see below).
+#
 # Idempotent — safe to re-run on upgrades.
 
 set -euo pipefail
@@ -9,9 +12,8 @@ export PATH="${HOME:-/root}/.cargo/bin:${PATH:-/usr/local/sbin:/usr/local/bin:/u
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BINARY="/usr/local/bin/soup-rendezvous"
-STATE_DIR="/var/lib/soup-rendezvous"
-KEY_FILE="$STATE_DIR/coordinator.nsec"
-SERVICE_FILE="/etc/systemd/system/soup-rendezvous.service"
+CONFIG_FILE="/etc/soup-rendezvous.toml"
+TEMPLATE_UNIT="/etc/systemd/system/soup-rendezvous@.service"
 
 if [ "$EUID" -ne 0 ]; then
   echo "must run as root (or with sudo)"
@@ -24,41 +26,44 @@ echo "=== building release binary ==="
 echo "=== installing binary to $BINARY ==="
 install -m 755 "$REPO_ROOT/target/release/soup-rendezvous" "$BINARY"
 
-echo "=== preparing state dir $STATE_DIR ==="
-install -d -m 700 -o root -g root "$STATE_DIR"
+echo "=== installing systemd template unit to $TEMPLATE_UNIT ==="
+install -m 644 "$REPO_ROOT/deploy/soup-rendezvous@.service" "$TEMPLATE_UNIT"
 
-if [ ! -f "$KEY_FILE" ]; then
-  echo "  FATAL: $KEY_FILE not found"
-  echo "  copy your coordinator nsec there first, then re-run:"
-  echo "    cp /path/to/coordinator.nsec $KEY_FILE"
-  echo "    chmod 600 $KEY_FILE"
-  echo "    chown root:root $KEY_FILE"
-  exit 1
+if [ ! -f "$CONFIG_FILE" ]; then
+  echo "=== installing example config to $CONFIG_FILE ==="
+  install -m 644 "$REPO_ROOT/deploy/soup-rendezvous.example.toml" "$CONFIG_FILE"
+  echo "  EDIT $CONFIG_FILE before enabling any instance."
+  echo "  Uncomment the networks you want to run, set the correct"
+  echo "  lightning_dir / bitcoin_dir paths, and decide whether to"
+  echo "  allow_peer_verification per network."
+else
+  echo "=== keeping existing $CONFIG_FILE (no overwrite) ==="
 fi
-
-# Enforce permissions even if the file already exists
-chmod 600 "$KEY_FILE"
-chown root:root "$KEY_FILE"
-
-echo "=== installing systemd unit ==="
-install -m 644 "$REPO_ROOT/deploy/soup-rendezvous.service" "$SERVICE_FILE"
 
 echo "=== reloading systemd ==="
 systemctl daemon-reload
 
-echo "=== enabling + starting service ==="
-systemctl enable soup-rendezvous.service
-systemctl restart soup-rendezvous.service
-
-sleep 2
-
-echo "=== status ==="
-systemctl status --no-pager soup-rendezvous.service || true
-
 echo
-echo "=== recent logs ==="
-journalctl -u soup-rendezvous.service --no-pager -n 20
-
+echo "=== install complete ==="
 echo
-echo "install complete. follow logs with:"
-echo "  journalctl -u soup-rendezvous.service -f"
+echo "To light up a network (signet as example):"
+echo
+echo "  1. Create state dir + generate nsec:"
+echo "       install -d -m 700 -o root -g root /var/lib/soup-rendezvous-signet"
+echo "       $BINARY --key-file /var/lib/soup-rendezvous-signet/coordinator.nsec init"
+echo
+echo "  2. Ensure cln-signet and (optionally) bitcoind-signet are running."
+echo
+echo "  3. Verify the [networks.signet] section in $CONFIG_FILE points"
+echo "     at the correct lightning_dir and bitcoin_dir."
+echo
+echo "  4. Enable the systemd instance:"
+echo "       systemctl enable --now soup-rendezvous@signet.service"
+echo
+echo "  5. Publish the root thread (one-time):"
+echo "       $BINARY --config $CONFIG_FILE --network signet publish-root \\"
+echo "         \"<coordinator description>\""
+echo
+echo "  6. Back up the nsec off-VPS (encrypted) before accepting traffic."
+echo
+echo "Tail logs for an instance:  journalctl -u soup-rendezvous@<network> -f"

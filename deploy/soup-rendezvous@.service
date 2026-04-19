@@ -1,5 +1,5 @@
 [Unit]
-Description=soup-rendezvous coordinator daemon
+Description=soup-rendezvous coordinator daemon (%i)
 Documentation=https://github.com/8144225309/soup-rendezvous
 After=network-online.target
 Wants=network-online.target
@@ -11,21 +11,21 @@ Type=simple
 User=root
 Group=root
 
-ExecStart=/usr/local/bin/soup-rendezvous --lightning-dir=/var/lib/cln-signet daemon
+# --config selects the TOML, --network picks the section by the
+# systemd instance name (mainnet / signet / testnet4 / etc).
+ExecStart=/usr/local/bin/soup-rendezvous \
+  --config=/etc/soup-rendezvous.toml \
+  --network=%i \
+  daemon
 
-Environment=SOUP_KEY_FILE=/var/lib/soup-rendezvous/coordinator.nsec
-Environment=SOUP_RELAYS=wss://nos.lol,wss://relay.damus.io
 Environment=RUST_LOG=soup_rendezvous=info,nostr_relay_pool=warn
 
 Restart=on-failure
 RestartSec=10
 
-# Journald log identifier
-SyslogIdentifier=soup-rendezvous
+SyslogIdentifier=soup-rendezvous-%i
 
-# Hardening — block every syscall / fs path we don't actually need.
-# Daemon needs: read nsec, spawn lightning-cli, talk to CLN rpc socket,
-# make outbound TCP to relays. Everything else denied.
+# Same hardening as the single-network unit.
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
@@ -47,11 +47,10 @@ SystemCallArchitectures=native
 SystemCallFilter=@system-service
 SystemCallErrorNumber=EPERM
 
-# Read-only access to the key file; read-write only to the CLN socket
-# directory (for subprocess calls that may need to write control files)
-ReadWritePaths=/var/lib/soup-rendezvous /var/lib/cln-signet
+# Per-instance state dir + matching CLN socket dir.
+ReadWritePaths=/var/lib/soup-rendezvous-%i /var/lib/cln-%i
+ReadOnlyPaths=/etc/soup-rendezvous.toml
 
-# Resource limits
 LimitNOFILE=4096
 TasksMax=64
 

@@ -25,11 +25,19 @@ DESIGN.md
 docs/DESIGN.md
 docs/PRODUCTION_PLAN.md
 PRODUCTION_PLAN.md
+docs/PRODUCTION_CONCERNS.md
+PRODUCTION_CONCERNS.md
+docs/SHIP_PLAN.md
+SHIP_PLAN.md
 
 # Editor / OS noise
 .DS_Store
 Thumbs.db
 .vscode/
 .idea/
+.claude/
 *.swp
 *~
+
+# Early drafts
+README.draft.md

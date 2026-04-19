@@ -1,0 +1,49 @@
+# /etc/soup-rendezvous.toml — example config for running one binary
+# across multiple networks. Copy to /etc/soup-rendezvous.toml and
+# point the systemd unit at it with --config.
+#
+# Precedence: per-network value > top-level default. Explicit CLI
+# flags are ignored when --config is in use — pick one source of
+# truth per run.
+
+# Shared across all networks unless overridden per-network.
+relays = [
+    "wss://nos.lol",
+    "wss://relay.damus.io",
+    "wss://relay.primal.net",
+    "wss://relay.nostr.band",
+    "wss://relay.snort.social",
+    "wss://offchain.pub",
+    "wss://nostr.fmt.wiz.biz",
+]
+vouch_expiry_days = 30
+
+# Max simultaneously-active vouches the coordinator will issue for one
+# LN node. Caps Nostr-key-rotation amplification. 10 leaves plenty of
+# headroom for legitimate key rotation / recovery.
+max_active_vouches_per_ln_node = 10
+
+[networks.signet]
+key_file = "/var/lib/soup-rendezvous-signet/coordinator.nsec"
+lightning_dir = "/var/lib/cln-signet"
+bitcoin_dir = "/var/lib/bitcoind-signet"
+min_utxo_balance_sat = 0          # permissive on test networks
+allow_peer_verification = true    # peer tier enabled on signet
+
+[networks.testnet4]
+key_file = "/var/lib/soup-rendezvous-testnet4/coordinator.nsec"
+lightning_dir = "/var/lib/cln-testnet4"
+bitcoin_dir = "/var/lib/bitcoind-testnet4"
+min_utxo_balance_sat = 0
+allow_peer_verification = true    # peer tier enabled on testnet4
+
+[networks.mainnet]
+key_file = "/var/lib/soup-rendezvous-mainnet/coordinator.nsec"
+lightning_dir = "/var/lib/cln-mainnet"
+bitcoin_dir = "/var/lib/bitcoind"
+# Raise for mainnet Sybil resistance. 100000 sats ≈ $60 per Sybil.
+min_utxo_balance_sat = 100000
+# Peer tier OFF by default on mainnet — leave commented or explicit false.
+# allow_peer_verification = false
+# Shorter refresh on mainnet to reduce stale-vouch exposure window.
+vouch_expiry_days = 14

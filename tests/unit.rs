@@ -14,7 +14,7 @@ fn root_thread_has_correct_kind_and_d_tag() {
     let builder = events::build_root_thread("test root");
     let event = builder.sign_with_keys(&keys).unwrap();
 
-    assert_eq!(event.kind, kinds::ADVERTISEMENT);
+    assert_eq!(event.kind, kinds::ROOT_THREAD);
     let d_tag = events::get_d_tag(&event);
     assert_eq!(d_tag.as_deref(), Some("root"));
     assert_eq!(event.content, "test root");
@@ -107,13 +107,21 @@ fn vouch_has_correct_tags() {
     let keys = Keys::generate();
     let host_keys = Keys::generate();
 
-    let builder = events::build_vouch(&host_keys.public_key(), "03abcdef", 12, "50000000");
+    let expiry = 1776000000u64 + 30 * 86400;
+    let builder = events::build_vouch(&host_keys.public_key(), "03abcdef", 12, "50000000", expiry);
     let event = builder.sign_with_keys(&keys).unwrap();
 
     assert_eq!(event.kind, kinds::VOUCH);
     assert_eq!(
         events::get_tag_value(&event, "ln_node_id").as_deref(),
         Some("03abcdef")
+    );
+
+    // d-tag must be host pubkey hex — makes the event parameterized-replaceable
+    // per host so multiple vouches from the coordinator don't overwrite each other
+    assert_eq!(
+        events::get_d_tag(&event).as_deref(),
+        Some(host_keys.public_key().to_hex().as_str())
     );
 
     // Check p-tag references host
@@ -129,11 +137,214 @@ fn vouch_has_correct_tags() {
         Some(host_keys.public_key().to_hex().as_str())
     );
 
-    // Content should be parseable JSON
+    // Content should be parseable JSON with status=active
     let parsed: serde_json::Value = serde_json::from_str(&event.content).unwrap();
+    assert_eq!(parsed["status"], "active");
+    assert_eq!(parsed["verification_source"], "ln_channel");
     assert_eq!(parsed["ln_node_id"], "03abcdef");
     assert_eq!(parsed["channel_count"], 12);
     assert_eq!(parsed["capacity_sat"], "50000000");
+    assert_eq!(parsed["expires_at"], expiry);
+
+    // NIP-40 expiration tag must be present
+    let has_expiration = event.tags.iter().any(|t| t.kind() == TagKind::Expiration);
+    assert!(has_expiration, "vouch must carry NIP-40 expiration tag");
+
+    // Filterable single-letter tag "l" = "channel"
+    let l_tag = event.tags.iter().find_map(|t| {
+        if t.kind() == TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::L)) {
+            t.content().map(|s| s.to_string())
+        } else {
+            None
+        }
+    });
+    assert_eq!(l_tag.as_deref(), Some("channel"));
+}
+
+#[test]
+fn utxo_vouch_has_correct_fields_and_tag() {
+    let coord = Keys::generate();
+    let host = Keys::generate();
+    let expiry = Timestamp::now().as_secs() + 30 * 86400;
+
+    let ev = events::build_vouch_utxo(
+        &host.public_key(),
+        "bc1qexampleaddressxxxxxxxxxxxxxxxxxxxx",
+        150_000,
+        "aabb".repeat(16).as_str(), // 64-hex txid
+        0,
+        expiry,
+    )
+    .sign_with_keys(&coord)
+    .unwrap();
+
+    assert_eq!(ev.kind, kinds::VOUCH);
+
+    // d-tag = host pubkey hex
+    assert_eq!(
+        events::get_d_tag(&ev).as_deref(),
+        Some(host.public_key().to_hex().as_str())
+    );
+
+    // l tag = "utxo"
+    let l_tag = ev.tags.iter().find_map(|t| {
+        if t.kind() == TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::L)) {
+            t.content().map(|s| s.to_string())
+        } else {
+            None
+        }
+    });
+    assert_eq!(l_tag.as_deref(), Some("utxo"));
+
+    // btc_address tag
+    assert_eq!(
+        events::get_tag_value(&ev, "btc_address").as_deref(),
+        Some("bc1qexampleaddressxxxxxxxxxxxxxxxxxxxx")
+    );
+
+    // Content schema
+    let parsed: serde_json::Value = serde_json::from_str(&ev.content).unwrap();
+    assert_eq!(parsed["status"], "active");
+    assert_eq!(parsed["verification_source"], "btc_utxo");
+    assert_eq!(
+        parsed["btc_address"],
+        "bc1qexampleaddressxxxxxxxxxxxxxxxxxxxx"
+    );
+    assert_eq!(parsed["verified_balance_sat"], "150000");
+    assert_eq!(parsed["utxo_vout"], 0);
+    assert_eq!(parsed["expires_at"], expiry);
+
+    // NIP-40 expiration tag
+    let has_expiration = ev.tags.iter().any(|t| t.kind() == TagKind::Expiration);
+    assert!(has_expiration);
+}
+
+#[test]
+fn peer_vouch_has_correct_fields_and_tag() {
+    let coord = Keys::generate();
+    let host = Keys::generate();
+    let expiry = Timestamp::now().as_secs() + 30 * 86400;
+
+    let ev = events::build_vouch_peer(
+        &host.public_key(),
+        "03peerexample",
+        &[
+            "host.example.com:9735".to_string(),
+            "ipv6.example:9735".to_string(),
+        ],
+        Some("080c8802"),
+        expiry,
+    )
+    .sign_with_keys(&coord)
+    .unwrap();
+
+    assert_eq!(ev.kind, kinds::VOUCH);
+
+    // d-tag = host pubkey hex
+    assert_eq!(
+        events::get_d_tag(&ev).as_deref(),
+        Some(host.public_key().to_hex().as_str())
+    );
+
+    // l tag = "peer"
+    let l_tag = ev.tags.iter().find_map(|t| {
+        if t.kind() == TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::L)) {
+            t.content().map(|s| s.to_string())
+        } else {
+            None
+        }
+    });
+    assert_eq!(l_tag.as_deref(), Some("peer"));
+
+    // peer_pubkey tag
+    assert_eq!(
+        events::get_tag_value(&ev, "peer_pubkey").as_deref(),
+        Some("03peerexample")
+    );
+
+    let parsed: serde_json::Value = serde_json::from_str(&ev.content).unwrap();
+    assert_eq!(parsed["status"], "active");
+    assert_eq!(parsed["verification_source"], "ln_peer");
+    assert_eq!(parsed["peer_pubkey"], "03peerexample");
+    assert_eq!(parsed["peer_addresses"][0], "host.example.com:9735");
+    assert_eq!(parsed["peer_addresses"][1], "ipv6.example:9735");
+    assert_eq!(parsed["features_hex"], "080c8802");
+    assert_eq!(parsed["expires_at"], expiry);
+}
+
+#[test]
+fn vouch_is_active_reports_true_for_fresh_active() {
+    let coord = Keys::generate();
+    let host = Keys::generate();
+    let expiry = Timestamp::now().as_secs() + 3600;
+    let ev = events::build_vouch(&host.public_key(), "03abc", 1, "0", expiry)
+        .sign_with_keys(&coord)
+        .unwrap();
+    assert!(events::vouch_is_active(&ev));
+    assert_eq!(events::vouch_ln_node_id(&ev).as_deref(), Some("03abc"));
+}
+
+#[test]
+fn vouch_is_active_reports_false_for_expired() {
+    let coord = Keys::generate();
+    let host = Keys::generate();
+    let expired = Timestamp::now().as_secs() - 60; // already past
+    let ev = events::build_vouch(&host.public_key(), "03abc", 1, "0", expired)
+        .sign_with_keys(&coord)
+        .unwrap();
+    assert!(!events::vouch_is_active(&ev));
+}
+
+#[test]
+fn vouch_is_active_reports_false_for_revoked() {
+    let coord = Keys::generate();
+    let host = Keys::generate();
+    let expiry = Timestamp::now().as_secs() + 30 * 86400;
+    let ev = events::build_revoke_vouch(&host.public_key(), "abuse", expiry)
+        .sign_with_keys(&coord)
+        .unwrap();
+    assert!(!events::vouch_is_active(&ev));
+    // Revoke events MUST carry NIP-40 expiration so they self-clean
+    // from relays — otherwise they accumulate forever.
+    let has_expiration = ev.tags.iter().any(|t| t.kind() == TagKind::Expiration);
+    assert!(has_expiration);
+}
+
+#[test]
+fn revoke_vouch_shares_d_tag_and_marks_revoked() {
+    let keys = Keys::generate();
+    let host_keys = Keys::generate();
+
+    let active = events::build_vouch(
+        &host_keys.public_key(),
+        "03abcdef",
+        12,
+        "50000000",
+        1776000000u64 + 30 * 86400,
+    )
+    .sign_with_keys(&keys)
+    .unwrap();
+    let revoke_expiry = Timestamp::now().as_secs() + 30 * 86400;
+    let revoked = events::build_revoke_vouch(
+        &host_keys.public_key(),
+        "operator misbehavior",
+        revoke_expiry,
+    )
+    .sign_with_keys(&keys)
+    .unwrap();
+
+    // Same kind + same d-tag + same author → relays supersede the active one
+    assert_eq!(active.kind, revoked.kind);
+    assert_eq!(events::get_d_tag(&active), events::get_d_tag(&revoked));
+    assert_eq!(
+        events::get_d_tag(&revoked).as_deref(),
+        Some(host_keys.public_key().to_hex().as_str())
+    );
+
+    let parsed: serde_json::Value = serde_json::from_str(&revoked.content).unwrap();
+    assert_eq!(parsed["status"], "revoked");
+    assert_eq!(parsed["reason"], "operator misbehavior");
+    assert!(parsed["revoked_at"].as_u64().is_some());
 }
 
 // --- NIP-44 encryption round-trip ---
@@ -299,7 +510,7 @@ fn challenge_format_is_valid() {
     let coordinator_npub = keys.public_key().to_bech32().unwrap();
     let random_bytes: [u8; 16] = rand::random();
     let challenge = format!(
-        "soup-rendezvous:proof-of-node:v0:{}:{}:{}",
+        "soup-rendezvous:proof-of-channel:v0:{}:{}:{}",
         coordinator_npub,
         hex::encode(random_bytes),
         Timestamp::now().as_secs()
@@ -308,7 +519,7 @@ fn challenge_format_is_valid() {
     let parts: Vec<&str> = challenge.split(':').collect();
     assert_eq!(parts.len(), 6);
     assert_eq!(parts[0], "soup-rendezvous");
-    assert_eq!(parts[1], "proof-of-node");
+    assert_eq!(parts[1], "proof-of-channel");
     assert_eq!(parts[2], "v0");
     assert_eq!(parts[3], &coordinator_npub);
     assert_eq!(parts[4].len(), 32); // 16 bytes hex
@@ -321,7 +532,7 @@ fn challenge_rejects_wrong_format() {
     assert!(
         parts.len() != 6
             || parts[0] != "soup-rendezvous"
-            || parts[1] != "proof-of-node"
+            || parts[1] != "proof-of-channel"
             || parts[2] != "v0"
     );
 }
@@ -334,7 +545,7 @@ fn challenge_rejects_wrong_coordinator() {
     let wrong_npub = wrong_keys.public_key().to_bech32().unwrap();
 
     let challenge = format!(
-        "soup-rendezvous:proof-of-node:v0:{}:deadbeef:1776000000",
+        "soup-rendezvous:proof-of-channel:v0:{}:deadbeef:1776000000",
         wrong_npub
     );
 

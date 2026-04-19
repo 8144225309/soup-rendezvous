@@ -5,9 +5,15 @@
 
 use nostr_sdk::Kind;
 
+/// Coordinator root thread. Addressable event (NIP-33 parameterized
+/// replaceable, d-tag `"root"`) — republishing replaces the prior
+/// version on relays. Separates the coordinator's identity post from
+/// factory advertisements so clients can filter cleanly.
+pub const ROOT_THREAD: Kind = Kind::Custom(38099);
+
 /// Factory advertisement. Addressable event (NIP-33 parameterized
 /// replaceable) — the host can update it by publishing a new event
-/// with the same d-tag. Also used for the coordinator's root thread.
+/// with the same d-tag (cohort name).
 pub const ADVERTISEMENT: Kind = Kind::Custom(38100);
 
 /// Coordinator vouch. Public attestation that a host proved control
