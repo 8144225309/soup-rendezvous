@@ -1,53 +1,14 @@
 //! Event builders for the coordination protocol.
+//!
+//! Three Nostr event kinds, one DM shape. The protocol is deliberately
+//! minimal — Nostr is the seed list of verified LSP contact pointers,
+//! nothing else. Factory parameters, slots, joins, and seal flow all
+//! happen LSP-to-wallet directly over Lightning after a wallet reads
+//! the seed list and dials the LSP.
 
 use nostr_sdk::prelude::*;
-use serde::{Deserialize, Serialize};
 
 use crate::kinds;
-
-/// SuperScalar factory parameters carried in the advertisement content.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SuperScalarPayload {
-    pub lsp_pubkey: String,
-    pub lsp_endpoints: Vec<String>,
-    pub lsp_nostr_relays: Vec<String>,
-    pub total_funding_sat: String,
-    pub client_contribution_sat: String,
-    pub lsp_liquidity_sat: String,
-    pub leaf_arity: u32,
-    pub epoch_count: u32,
-    pub lifetime_blocks: u32,
-    pub dying_period_blocks: u32,
-    pub lsp_fee_sat: String,
-    pub lsp_fee_ppm: u32,
-}
-
-/// Joiner's attestation payload (encrypted to host via NIP-44).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AttestationPayload {
-    pub joiner_cln_pubkey: String,
-    pub joiner_cln_endpoint: String,
-    pub joiner_nostr_relays: Vec<String>,
-    pub nonce: String,
-    pub message: String,
-}
-
-/// Seal manifest (encrypted to each cohort member via NIP-44).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SealManifest {
-    pub advertisement_id: String,
-    pub rules_hash: String,
-    pub members: Vec<SealMember>,
-    pub sealed_at: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SealMember {
-    pub nostr_pubkey: String,
-    pub cln_pubkey: String,
-    pub cln_endpoint: String,
-    pub slot: u32,
-}
 
 /// Build the coordinator's root discovery thread event.
 ///
@@ -56,81 +17,6 @@ pub struct SealMember {
 /// or rotate keys) automatically replaces the prior version.
 pub fn build_root_thread(description: &str) -> EventBuilder {
     EventBuilder::new(kinds::ROOT_THREAD, description).tag(Tag::identifier("root"))
-}
-
-/// Build a factory advertisement event.
-#[allow(clippy::too_many_arguments)]
-pub fn build_advertisement(
-    root_event_id: &EventId,
-    cohort_name: &str,
-    scheme: &str,
-    min_members: u32,
-    max_members: u32,
-    tags: &[&str],
-    expiry_unix: u64,
-    content: &str,
-) -> EventBuilder {
-    let mut builder = EventBuilder::new(kinds::ADVERTISEMENT, content)
-        .tag(Tag::identifier(cohort_name))
-        .tag(Tag::event(*root_event_id))
-        .tag(Tag::custom(
-            TagKind::custom("scheme"),
-            vec![scheme.to_string()],
-        ))
-        .tag(Tag::custom(
-            TagKind::custom("min_members"),
-            vec![min_members.to_string()],
-        ))
-        .tag(Tag::custom(
-            TagKind::custom("max_members"),
-            vec![max_members.to_string()],
-        ))
-        .tag(Tag::custom(
-            TagKind::custom("slots"),
-            vec![format!("0/{max_members}")],
-        ))
-        .tag(Tag::custom(
-            TagKind::custom("expiry"),
-            vec![expiry_unix.to_string()],
-        ))
-        .tag(Tag::expiration(Timestamp::from(expiry_unix)));
-
-    for t in tags {
-        builder = builder.tag(Tag::hashtag(*t));
-    }
-
-    builder
-}
-
-/// Build a status update event for a factory.
-pub fn build_status_update(
-    ad_event_id: &EventId,
-    scheme: &str,
-    status: &str,
-    accepted_count: u32,
-    max_members: u32,
-    message: &str,
-) -> EventBuilder {
-    let content = serde_json::json!({
-        "message": message,
-        "accepted_count": accepted_count,
-        "max_members": max_members,
-    });
-
-    EventBuilder::new(kinds::STATUS_UPDATE, content.to_string())
-        .tag(Tag::event(*ad_event_id))
-        .tag(Tag::custom(
-            TagKind::custom("scheme"),
-            vec![scheme.to_string()],
-        ))
-        .tag(Tag::custom(
-            TagKind::custom("status"),
-            vec![status.to_string()],
-        ))
-        .tag(Tag::custom(
-            TagKind::custom("slots"),
-            vec![format!("{accepted_count}/{max_members}")],
-        ))
 }
 
 /// Tier of a published vouch — encoded as the `["l", ...]` tag value
@@ -169,19 +55,19 @@ impl VouchTier {
 /// Kind 38101, parameterized-replaceable with d-tag = host pubkey hex.
 /// Republishing automatically replaces the prior version.
 ///
-/// The published vouch carries **only what wallets need to contact the
-/// host's LN node**: the `ln_node_id` (LN pubkey to dial), an optional
+/// The published vouch is a **contact pointer** into the seed list:
+/// the `ln_node_id` (LN pubkey wallets dial), an optional
 /// `ln_addresses` list (host:port pairs, only needed if the node isn't
-/// in BOLT-7 gossip), the tier label, and freshness metadata. All other
-/// fields the coordinator has knowledge of (btc_address, channel count,
-/// verified balance, feature bits, etc.) are deliberately stripped to
-/// avoid leaking host-side topology / financial info beyond what's
-/// necessary for contact.
+/// in BOLT-7 gossip), the tier label, and freshness metadata. All
+/// other facts the coordinator verified (btc_address, channel count,
+/// UTXO outpoint, feature bits) are deliberately stripped from
+/// publication — everything else about the factory comes from dialing
+/// the LSP directly over LN.
 ///
-/// `btc_address_hash` is utxo-tier only: the daemon writes a truncated
-/// SHA-256 of the verified bitcoin address into a `["btc_hash", ...]`
-/// tag so it can rebuild per-address cap state on startup without
-/// publishing the address itself. Wallets ignore this tag.
+/// `btc_address_hash` is utxo-tier only: a truncated SHA-256 of the
+/// verified bitcoin address, stored in a `["btc_hash", ...]` tag so
+/// the daemon can rebuild per-address Sybil cap state on restart
+/// without publishing the address itself. Wallets ignore this tag.
 ///
 /// `expiry_unix` attaches a NIP-40 expiration tag. Hosts re-prove
 /// before this passes; conformant relays drop the event after, and
@@ -219,10 +105,6 @@ pub fn build_vouch(
         .tag(Tag::expiration(Timestamp::from(expiry_unix)));
 
     if let Some(h) = btc_address_hash {
-        // Daemon-internal cap-rebuild aid for utxo-tier. Truncated
-        // SHA-256 of the verified bitcoin address — preimage-resistant
-        // so wallets can't reverse it back to a public address. Not
-        // listed in the public field reference; wallets ignore it.
         builder = builder.tag(Tag::custom(
             TagKind::custom("btc_hash"),
             vec![h.to_string()],
@@ -259,40 +141,12 @@ pub fn build_revoke_vouch(
         .tag(Tag::expiration(Timestamp::from(expiry_unix)))
 }
 
-/// Build an encrypted attestation (join request).
-/// The content is NIP-44 encrypted to the host's pubkey by the caller.
-pub fn build_attestation(ad_event_id: &EventId, scheme: &str, expiry_unix: u64) -> EventBuilder {
-    // Content will be set by the caller after NIP-44 encryption.
-    // We build with empty content; the caller replaces it.
-    EventBuilder::new(kinds::ATTESTATION, "")
-        .tag(Tag::event(*ad_event_id))
-        .tag(Tag::custom(
-            TagKind::custom("scheme"),
-            vec![scheme.to_string()],
-        ))
-        .tag(Tag::custom(
-            TagKind::custom("expiry"),
-            vec![expiry_unix.to_string()],
-        ))
-}
-
-/// Build a seal event. Content is the encrypted manifest.
-pub fn build_seal(ad_event_id: &EventId, scheme: &str) -> EventBuilder {
-    EventBuilder::new(kinds::SEAL, "")
-        .tag(Tag::event(*ad_event_id))
-        .tag(Tag::custom(
-            TagKind::custom("scheme"),
-            vec![scheme.to_string()],
-        ))
-}
-
 // --- helpers for inspecting fetched vouch events ---
 
 /// True if a fetched kind-38101 event is currently the active form of
 /// a vouch: its NIP-40 expiration has not passed AND its content status
 /// is `"active"`. A revoked or expired event counts as not active.
 pub fn vouch_is_active(event: &Event) -> bool {
-    // NIP-40 expiration check
     let now = Timestamp::now().as_secs();
     for tag in event.tags.iter() {
         if tag.kind() == TagKind::Expiration
@@ -304,7 +158,6 @@ pub fn vouch_is_active(event: &Event) -> bool {
         }
     }
 
-    // Content status check
     serde_json::from_str::<serde_json::Value>(&event.content)
         .ok()
         .and_then(|v| v.get("status").and_then(|s| s.as_str()).map(String::from))
@@ -321,8 +174,8 @@ pub fn vouch_ln_node_id(event: &Event) -> Option<String> {
 /// utxo-tier vouch's daemon-internal `["btc_hash", ...]` tag so the
 /// daemon can rebuild per-address cap state at startup without
 /// publishing the address itself. 24 hex chars = 96 bits — far more
-/// than enough Sybil collision resistance, and short enough to keep
-/// vouches lean.
+/// than enough collision resistance for Sybil-cap purposes, and short
+/// enough to keep vouches lean.
 pub fn btc_address_hash(btc_address: &str) -> String {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();

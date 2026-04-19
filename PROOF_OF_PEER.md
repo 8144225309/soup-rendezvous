@@ -154,7 +154,7 @@ For peer-tier the `ln_node_id` IS the verified peer pubkey (the BOLT-8 handshake
 
 The handshake observes feature bits during BOLT-1 init exchange but the bits are not republished — wallets re-observe them on first dial. Same rationale for everything else: the vouch is a contact pointer, not a profile.
 
-See [WALLET_INTEGRATION.md §2](./WALLET_INTEGRATION.md) for the full unified field reference and trust model.
+See [WALLET_INTEGRATION.md §5](./WALLET_INTEGRATION.md) for the full unified field reference.
 
 ## Wallet-side recommendation
 

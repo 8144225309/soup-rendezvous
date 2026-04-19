@@ -16,7 +16,7 @@ Channel and UTXO are both chain-anchored and co-equal in trust — pick whicheve
 
 ## Why this exists
 
-Anyone can create a Nostr keypair and post a factory advertisement. Proof-of-channel ensures the host actually operates a real Lightning node that's chain-anchored through an announced channel. Spammers would need to fund real on-chain channels to get vouched. Legitimate LSPs already have them.
+Anyone can create a Nostr keypair and ask to be listed in the coordinator's seed list. Proof-of-channel ensures the host actually operates a real Lightning node that's chain-anchored through an announced channel. Spammers would need to fund real on-chain channels to get vouched. Legitimate LSPs already have them.
 
 ## Why this is called "proof-of-channel," not "proof-of-node"
 
@@ -30,7 +30,7 @@ Because a node only appears in the gossip graph after its counterparty's `channe
 
 So what we're really verifying is *not* "does this node exist in principle" (which just means "does someone have the private key," a trivial bar) but *"does this node have at least one chain-anchored channel"* — which has a non-trivial on-chain cost floor (~$1-3 per channel open at current mainnet fees). That's the name change.
 
-**Hosts with zero announced channels cannot be vouched under this proof type alone.** They need to open at least one small channel, wait for gossip propagation (usually minutes), and try again — OR include a proof-of-UTXO alongside the channel proof in a multi-method DM (see [WALLET_INTEGRATION.md §7.1a](./WALLET_INTEGRATION.md)) so the coordinator falls through to utxo-tier while gossip catches up.
+**Hosts with zero announced channels cannot be vouched under this proof type alone.** They need to open at least one small channel, wait for gossip propagation (usually minutes), and try again — OR include a proof-of-UTXO alongside the channel proof in a multi-method DM (see [WALLET_INTEGRATION.md §9](./WALLET_INTEGRATION.md)) so the coordinator falls through to utxo-tier while gossip catches up.
 
 ### Young peer fallback
 
@@ -50,7 +50,7 @@ The host does all the work. The coordinator issues nothing and waits for no roun
 5. Coordinator sends a confirmation DM back. Done.
 ```
 
-No pre-challenge handshake. No back-and-forth. See [WALLET_INTEGRATION.md §7.1](./WALLET_INTEGRATION.md) for the exact DM schema.
+No pre-challenge handshake. No back-and-forth. See [WALLET_INTEGRATION.md §9](./WALLET_INTEGRATION.md) for the exact DM schema.
 
 ## Challenge format
 
