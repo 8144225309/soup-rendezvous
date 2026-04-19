@@ -16,11 +16,11 @@ Peer-tier is a **bootstrap path**, not a steady-state target. If you get vouched
 
 ## Why there is no LN feature-bit filter (e.g. "require BLIP-56 support")
 
-It would be natural to ask: why doesn't the coordinator also check that the peer advertises the feature bits the ecosystem needs (BLIP-56 for SuperScalar, etc.)? Answer: **feature compatibility belongs on the factory ad's `scheme` tag, not on the vouch.**
+It would be natural to ask: why doesn't the coordinator also check that the peer advertises the feature bits the ecosystem needs (BLIP-56 for SuperScalar, etc.)? Answer: **feature/scheme compatibility is a wallet-side concern, handled at dial time over LN.**
 
-The vouch attests identity — "this Nostr key controls this LN node." What protocols that node can run is a per-factory decision: the same operator might run multiple factories with different schemes over time, and the scheme tag on each kind-38100 advertisement is the right granularity. Wallets subscribe with `"#scheme": ["superscalar/v1"]` and only see ads from hosts whose factory claims to support what the wallet wants. If the host misreports (advertises a scheme they can't actually run), the wallet catches it at join time or signing time and picks a different host.
+The vouch attests identity — "this Nostr key controls this LN node." What protocols that node can run is a per-factory decision the wallet resolves by dialing the LSP directly over LN and asking. If the host misreports its capabilities at dial, the wallet just picks a different host. The worst case is a wasted dial; no funds at risk.
 
-Pushing feature filtering into the vouch would over-couple identity attestation with capability advertising. The coordinator stays scheme-agnostic by design.
+Pushing feature filtering into the vouch would over-couple identity attestation with capability advertising, bloat the vouch, and duplicate information that's already authoritative on the LN side. The coordinator stays scheme-agnostic by design.
 
 ## What this actually proves
 
