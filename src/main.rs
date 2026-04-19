@@ -275,7 +275,21 @@ enum Command {
     /// Subscribes for proof requests sent as NIP-44 encrypted DMs to our
     /// pubkey, verifies each tier the host submitted, and publishes a
     /// vouch on success. Host-driven one-shot flow — no round-trips.
-    Daemon,
+    Daemon {
+        /// Total-loss recovery mode: force the startup DM scan to go
+        /// back N days regardless of what `last_seen_dm.txt` says
+        /// (or even if the file is missing). Intended for bringing a
+        /// fresh instance — one where only `coordinator.nsec` was
+        /// restored from backup — back to a working state that
+        /// replays every in-flight proof request from the recovery
+        /// window. Bounded by `MAX_DM_LOOKBACK_SECS` (60 days).
+        /// Typical usage: `--rebuild-from-days 7` matches the
+        /// self-healing envelope (challenge freshness past window +
+        /// processed-events TTL). Default unset = normal boot,
+        /// resumes from the persisted high-water mark.
+        #[arg(long)]
+        rebuild_from_days: Option<u64>,
+    },
 }
 
 #[tokio::main]
@@ -463,7 +477,7 @@ async fn main() -> Result<()> {
             )
             .await
         }
-        Command::Daemon => {
+        Command::Daemon { rebuild_from_days } => {
             let keys = load_keys(&cli.key_file)?;
             let client = connect(&cli.relays, &keys, cli.proxy_url.as_deref()).await?;
             cmd_daemon(
@@ -478,6 +492,7 @@ async fn main() -> Result<()> {
                 cli.max_active_vouches_per_peer,
                 cli.vouch_expiry_days,
                 cli.max_active_vouches_per_ln_node,
+                rebuild_from_days,
             )
             .await
         }
@@ -1557,6 +1572,7 @@ async fn cmd_daemon(
     max_active_vouches_per_peer: u32,
     vouch_expiry_days: u64,
     max_active_vouches_per_ln_node: u32,
+    rebuild_from_days: Option<u64>,
 ) -> Result<()> {
     let coordinator_npub = keys.public_key().to_bech32()?;
     let coordinator_pk = keys.public_key();
@@ -1625,32 +1641,52 @@ async fn cmd_daemon(
     // file, or in response to an adversarial lookback request.
     let last_seen_path = last_seen_dm_path(key_file);
     let startup_now = Timestamp::now().as_secs();
-    let raw_since_ts = match last_seen_path
-        .as_ref()
-        .and_then(|p| load_last_seen_dm(p).map(|ts| (p, ts)))
-    {
-        Some((path, ts)) => {
-            let gap_secs = startup_now.saturating_sub(ts);
-            tracing::info!(
-                last_seen_ts = ts,
-                gap_seconds = gap_secs,
-                path = %path.display(),
-                "resuming DM scan from persisted last_seen_dm; backlog from this window will be replayed"
-            );
-            ts
-        }
-        None => {
-            if let Some(p) = last_seen_path.as_ref() {
+
+    // Total-loss recovery: `--rebuild-from-days N` overrides the
+    // persisted high-water mark entirely, forcing a scan back N days.
+    // Designed for spinning up a fresh instance from just the nsec,
+    // on a blank VPS, and having it replay every in-flight proof
+    // request from the recovery window. Clamped to MAX_DM_LOOKBACK_SECS.
+    let raw_since_ts = if let Some(days) = rebuild_from_days {
+        let max_days = MAX_DM_LOOKBACK_SECS / 86400;
+        let clamped_days = days.min(max_days).max(1);
+        let rebuild_ts = startup_now.saturating_sub(clamped_days * 86400);
+        tracing::warn!(
+            requested_days = days,
+            clamped_days,
+            max_days,
+            rebuild_ts,
+            "REBUILD MODE: --rebuild-from-days override active; ignoring persisted last_seen_dm and scanning backwards from {clamped_days} days ago. Duplicate confirmation DMs possible if processed_events.txt is also missing — safe but hosts may receive a second confirmation for requests they already got answered."
+        );
+        rebuild_ts
+    } else {
+        match last_seen_path
+            .as_ref()
+            .and_then(|p| load_last_seen_dm(p).map(|ts| (p, ts)))
+        {
+            Some((path, ts)) => {
+                let gap_secs = startup_now.saturating_sub(ts);
                 tracing::info!(
-                    path = %p.display(),
-                    "no prior last_seen_dm found; starting from now (fresh state)"
+                    last_seen_ts = ts,
+                    gap_seconds = gap_secs,
+                    path = %path.display(),
+                    "resuming DM scan from persisted last_seen_dm; backlog from this window will be replayed"
                 );
-            } else {
-                tracing::warn!(
-                    "key_file has no parent dir; cannot persist last_seen_dm — backlog on restart will be lost"
-                );
+                ts
             }
-            startup_now
+            None => {
+                if let Some(p) = last_seen_path.as_ref() {
+                    tracing::info!(
+                        path = %p.display(),
+                        "no prior last_seen_dm found; starting from now (fresh state). For total-loss recovery from backup, pass --rebuild-from-days <N> to scan backwards N days."
+                    );
+                } else {
+                    tracing::warn!(
+                        "key_file has no parent dir; cannot persist last_seen_dm — backlog on restart will be lost"
+                    );
+                }
+                startup_now
+            }
         }
     };
     let floor_ts = startup_now.saturating_sub(MAX_DM_LOOKBACK_SECS);
@@ -1659,7 +1695,7 @@ async fn cmd_daemon(
             raw_since_ts,
             floor_ts,
             max_lookback_days = MAX_DM_LOOKBACK_SECS / 86400,
-            "clamping DM scan window: persisted last_seen_dm is older than max lookback; entries before the clamp are discarded"
+            "clamping DM scan window: since_ts is older than max lookback; entries before the clamp are discarded"
         );
         floor_ts
     } else {

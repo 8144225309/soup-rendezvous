@@ -125,6 +125,8 @@ The only durable state files live next to `coordinator.nsec`:
 | `last_seen_dm.txt` | High-water mark of DM `created_at` so a restart subscribes `.since(ts)` and replays the offline backlog | No — but only loses the backlog window, not published vouches |
 | `processed_events.txt` | Exactly-once dedup set of DM event ids (7-day TTL, atomic writes) | No — worst case is a duplicate confirmation DM on one replayed request |
 
+**Total-loss recovery.** If the daemon's state files (everything except `coordinator.nsec`) are lost — e.g. you're spinning up a second instance on a fresh VPS from just a key backup — pass `--rebuild-from-days <N>` to the `daemon` subcommand. That overrides the persisted `last_seen_dm` and scans the relays backwards N days on this boot. Typical usage: `--rebuild-from-days 7` to match the self-healing envelope below; bounded by `MAX_DM_LOOKBACK_SECS` (60 days). Cap state is always re-derived live from Nostr on every proof, so the only thing recovery mode "rebuilds" is the DM backlog window.
+
 **Offline tolerance.** The effective self-healing window is **7 days** — the maximum age of a DM the daemon will process after coming back online. Three cooperating mechanisms set this bound:
 
 - `PROCESSED_EVENTS_TTL_SECS = 7d` — dedup set of handled event ids, atomically persisted.
