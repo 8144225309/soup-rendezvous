@@ -72,7 +72,7 @@ soup-rendezvous:proof-of-channel:v0:npub1zgqcy07tv2gqu...s3wxurq:031799dbcc9b897
 | `v0` | Protocol version — allows format changes without breaking old implementations |
 | `<coordinator-npub>` | Binds the signature to a specific coordinator — prevents replay to a different coordinator |
 | `<random-hex>` | 16 bytes of cryptographic randomness — prevents pre-computation and prediction |
-| `<unix-timestamp>` | Freshness — coordinator rejects challenges where \|now − ts\| > 300 seconds |
+| `<unix-timestamp>` | Freshness — coordinator rejects challenges where \|now − ts\| > 300 seconds. The `ts` is the host's wall-clock time at the moment it constructed the challenge; the `now` is the coordinator's wall-clock time at verification. Hosts with NTP drift beyond ±5 minutes will see their proofs bounce as `challenge_expired` — fix NTP. |
 
 ### Why host-constructed challenges are safe
 

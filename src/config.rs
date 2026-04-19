@@ -79,12 +79,6 @@ pub struct ConfigFile {
     #[serde(default)]
     pub max_active_vouches_per_peer: Option<u32>,
 
-    // Note: LN feature-bit filtering (e.g. "require blip56 support")
-    // deliberately lives on the ad's `scheme` tag, not on the vouch.
-    // The coordinator stays scheme-agnostic; capability compatibility
-    // is a wallet-host pairing concern surfaced at factory-selection
-    // time. See PROOF_OF_PEER.md for the design rationale.
-
     #[serde(default)]
     pub networks: HashMap<String, NetworkSection>,
 }

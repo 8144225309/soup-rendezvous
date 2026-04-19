@@ -470,6 +470,7 @@ async fn main() -> Result<()> {
                 &client,
                 &keys,
                 &cli.key_file,
+                cli.network.as_deref(),
                 cli.lightning_dir.as_deref(),
                 cli.bitcoin_dir.as_deref(),
                 cli.min_utxo_balance_sat,
@@ -1217,6 +1218,27 @@ async fn cmd_request_vouch_multi(
     Ok(())
 }
 
+/// Extension trait for `Mutex` lock acquisition that recovers from
+/// poisoning instead of panicking. A poisoned mutex means some prior
+/// task panicked while holding the lock; the protected data is still
+/// structurally valid (Rust's type system guarantees this), so the
+/// only real risk is a partially-updated counter. We log loudly and
+/// keep serving — one bad DM shouldn't brick the whole daemon.
+trait LockRecover<T> {
+    fn lock_state(&self) -> std::sync::MutexGuard<'_, T>;
+}
+
+impl<T> LockRecover<T> for std::sync::Mutex<T> {
+    fn lock_state(&self) -> std::sync::MutexGuard<'_, T> {
+        self.lock().unwrap_or_else(|poisoned| {
+            tracing::error!(
+                "state mutex was poisoned — a prior task panicked while holding the lock; recovering and continuing"
+            );
+            poisoned.into_inner()
+        })
+    }
+}
+
 /// Rate limiter, replay cache, and observability counters for the daemon.
 /// All state is in-memory; cleared on restart. For our scale
 /// (a handful of requests per day) this is plenty.
@@ -1267,13 +1289,16 @@ struct DaemonState {
     /// notification handler dispatched with `created_at <= startup_now`.
     /// Purely observational.
     backlog_processed: u64,
-    /// Durable dedup set: event ids of every DM whose handler we've
-    /// run to completion (success or structured failure). Paired with
-    /// `processed_events.txt` so a restart never re-invokes the handler
-    /// for an event we already saw — no duplicate vouches, no duplicate
-    /// confirmation DMs. Entries older than PROCESSED_EVENTS_TTL_SECS
-    /// are pruned at startup.
-    processed_events: std::collections::HashSet<EventId>,
+    /// Durable dedup map: every DM whose handler we've run to completion
+    /// (success or structured failure), keyed by event id with the DM's
+    /// `created_at` as value. Persisted to `processed_events.txt` via
+    /// atomic full-file rewrite on each advance, so a restart never
+    /// re-invokes the handler for an event we already saw — no duplicate
+    /// vouches, no duplicate confirmation DMs. Entries older than
+    /// PROCESSED_EVENTS_TTL_SECS are pruned at startup. Keeping the
+    /// timestamp alongside the id lets us rewrite the whole file
+    /// atomically rather than relying on a tearable append.
+    processed_events: std::collections::HashMap<EventId, u64>,
     /// Count of events short-circuited because their id was already in
     /// `processed_events`. Observability for the exactly-once path.
     duplicates_skipped: u64,
@@ -1511,6 +1536,7 @@ async fn cmd_daemon(
     client: &Client,
     keys: &Keys,
     key_file: &std::path::Path,
+    network: Option<&str>,
     lightning_dir: Option<&std::path::Path>,
     bitcoin_dir: Option<&std::path::Path>,
     min_utxo_balance_sat: u64,
@@ -1524,6 +1550,7 @@ async fn cmd_daemon(
 
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
+        network = network.unwrap_or("<unset>"),
         npub = %coordinator_npub,
         vouch_expiry_days,
         max_active_vouches_per_ln_node,
@@ -1532,16 +1559,40 @@ async fn cmd_daemon(
         "daemon starting"
     );
 
-    if allow_peer_verification {
-        tracing::warn!(
-            "proof-of-peer verification is ENABLED on this coordinator — peer-tier vouches have no chain anchor, only enable on networks that accept the weaker guarantee"
-        );
-    }
-
+    // --- Startup config sanity checks ---
+    // Every silent misconfig here causes the daemon to reject every
+    // proof request of some tier with a generic rejection reason. We
+    // surface them loudly at startup so operators catch the problem
+    // before a host wastes round trips trying to get vouched.
     if lightning_dir.is_none() {
         tracing::warn!(
-            "no --lightning-dir set, proof-of-channel requests will be rejected (no way to verify)"
+            "no --lightning-dir set: proof-of-channel requests will be rejected (can't shell out to lightning-cli)"
         );
+    }
+    if bitcoin_dir.is_none() {
+        tracing::warn!(
+            "no --bitcoin-dir set: proof-of-utxo requests will be rejected (can't shell out to bitcoin-cli)"
+        );
+    }
+    if lightning_dir.is_none() && bitcoin_dir.is_none() && !allow_peer_verification {
+        tracing::error!(
+            "no verification tier is usable: --lightning-dir, --bitcoin-dir, and allow_peer_verification are all disabled — every proof request will be rejected"
+        );
+    }
+    if allow_peer_verification {
+        tracing::warn!(
+            "proof-of-peer verification is ENABLED — peer-tier vouches have no chain anchor; only appropriate for test networks or bootstrap use"
+        );
+        if lightning_dir.is_none() {
+            tracing::warn!(
+                "allow_peer_verification=true but --lightning-dir is unset: peer-tier requests will still fail (the BOLT-8 dial uses lightning-cli connect)"
+            );
+        }
+        if network == Some("mainnet") {
+            tracing::error!(
+                "allow_peer_verification=true on MAINNET — this is almost never what you want; peer-tier has no Sybil floor and wallets should be filtering it out, but listing it here widens the attack surface. Set allow_peer_verification = false for [networks.mainnet] unless you have a concrete reason."
+            );
+        }
     }
 
     // Resume from the last DM timestamp we persisted (if any) so a
@@ -1662,8 +1713,7 @@ async fn cmd_daemon(
             loop {
                 ticker.tick().await;
                 let summary = state
-                    .lock()
-                    .expect("state mutex poisoned")
+                    .lock_state()
                     .metrics_summary();
                 tracing::info!("{summary}");
             }
@@ -1692,12 +1742,12 @@ async fn cmd_daemon(
                     // no duplicate vouch is published and no duplicate
                     // confirmation DM is sent. Done before any work.
                     let already_processed = {
-                        let s = state.lock().expect("state mutex poisoned");
-                        s.processed_events.contains(&event.id)
+                        let s = state.lock_state();
+                        s.processed_events.contains_key(&event.id)
                     };
                     if already_processed {
                         {
-                            let mut s = state.lock().expect("state mutex poisoned");
+                            let mut s = state.lock_state();
                             s.duplicates_skipped += 1;
                         }
                         tracing::info!(
@@ -1740,11 +1790,16 @@ async fn cmd_daemon(
 
                     // Record this event id as processed so a restart
                     // never re-invokes the handler for it, then advance
-                    // the last_seen_dm high-water mark.
-                    let persist_last_seen = {
-                        let mut s = state.lock().expect("state mutex poisoned");
-                        s.processed_events.insert(event.id);
-                        if event_ts > s.last_seen_created_at {
+                    // the last_seen_dm high-water mark. Both files are
+                    // written via atomic tmp+rename; snapshot the
+                    // processed map under the lock, drop the lock, then
+                    // write. Inter-file drift is safe: whichever file
+                    // wins, the exactly-once guard at the top of the
+                    // handler short-circuits on the replayed event.
+                    let (processed_snapshot, persist_last_seen) = {
+                        let mut s = state.lock_state();
+                        s.processed_events.insert(event.id, event_ts);
+                        let persist_last_seen = if event_ts > s.last_seen_created_at {
                             s.last_seen_created_at = event_ts;
                             if is_backlog {
                                 s.backlog_processed += 1;
@@ -1752,10 +1807,16 @@ async fn cmd_daemon(
                             Some(event_ts)
                         } else {
                             None
-                        }
+                        };
+                        let snapshot: Vec<(u64, EventId)> = s
+                            .processed_events
+                            .iter()
+                            .map(|(id, ts)| (*ts, *id))
+                            .collect();
+                        (snapshot, persist_last_seen)
                     };
                     if let Some(path) = &processed_events_path {
-                        append_processed_event(path, event_ts, &event.id);
+                        save_processed_events(path, &processed_snapshot);
                     }
                     if let (Some(ts), Some(path)) = (persist_last_seen, &last_seen_path) {
                         save_last_seen_dm(path, ts);
@@ -1783,13 +1844,41 @@ fn load_last_seen_dm(path: &std::path::Path) -> Option<u64> {
 }
 
 fn save_last_seen_dm(path: &std::path::Path, ts: u64) {
-    if let Err(e) = std::fs::write(path, ts.to_string()) {
+    if let Err(e) = write_file_atomic(path, ts.to_string().as_bytes()) {
         tracing::warn!(
             error = %e,
             path = %path.display(),
-            "failed to persist last_seen_dm; offline-backlog resume after next restart may miss events"
+            "failed to persist last_seen_dm atomically; offline-backlog resume after next restart may miss events"
         );
     }
+}
+
+/// Write a file atomically: stage bytes in `<path>.tmp`, fsync the data,
+/// then rename onto `path`. Rename is atomic on POSIX, and on NTFS as
+/// long as source and target are on the same volume (they are — both
+/// sit in the daemon state directory next to the nsec). Callers can
+/// trust that either the old contents or the new contents are visible
+/// after a crash, never a torn half-written file.
+fn write_file_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let tmp = path.with_extension("tmp");
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, path)?;
+    // Best-effort parent-dir fsync so the rename itself is durable on
+    // POSIX after a power loss. No-op on Windows (opening a directory
+    // as a file isn't supported) where NTFS's rename + metadata
+    // journaling already give us what we need.
+    #[cfg(unix)]
+    if let Some(parent) = path.parent()
+        && let Ok(dir) = std::fs::File::open(parent)
+    {
+        let _ = dir.sync_all();
+    }
+    Ok(())
 }
 
 /// Path of the persistent event-id dedup file, next to the key file.
@@ -1798,30 +1887,29 @@ fn processed_events_path(key_file: &std::path::Path) -> Option<std::path::PathBu
 }
 
 /// Read `processed_events.txt`, drop entries older than TTL, and return
-/// the surviving set. Also rewrites the file compacted if any pruning
-/// happened, so the file bounds over time. Any parse error on a single
-/// line is logged and that line skipped; the rest load.
+/// the surviving map. Also rewrites the file atomically if any pruning
+/// happened, so the file is bounded over time. Any parse error on a
+/// single line is skipped.
 ///
 /// Format: one entry per line, `<created_at_secs> <event_id_hex>`.
 fn load_processed_events(
     path: &std::path::Path,
     now: u64,
-) -> std::collections::HashSet<EventId> {
-    use std::collections::HashSet;
-    let mut set = HashSet::new();
+) -> std::collections::HashMap<EventId, u64> {
+    use std::collections::HashMap;
+    let mut map: HashMap<EventId, u64> = HashMap::new();
     let content = match std::fs::read_to_string(path) {
         Ok(s) => s,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return set,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return map,
         Err(e) => {
             tracing::warn!(
                 error = %e,
                 path = %path.display(),
                 "processed_events read failed; starting with empty set (restart may reprocess some DMs)"
             );
-            return set;
+            return map;
         }
     };
-    let mut kept_lines: Vec<String> = Vec::new();
     let mut dropped = 0u64;
     for line in content.lines() {
         let line = line.trim();
@@ -1845,49 +1933,38 @@ fn load_processed_events(
             Ok(id) => id,
             Err(_) => continue,
         };
-        set.insert(id);
-        kept_lines.push(format!("{ts} {id_hex}"));
+        map.insert(id, ts);
     }
     if dropped > 0 {
-        let rewritten = kept_lines.join("\n");
-        let rewritten = if rewritten.is_empty() {
-            String::new()
-        } else {
-            format!("{rewritten}\n")
-        };
-        if let Err(e) = std::fs::write(path, rewritten) {
-            tracing::warn!(
-                error = %e,
-                path = %path.display(),
-                "processed_events compaction rewrite failed (non-fatal; set still loaded in memory)"
-            );
-        }
+        let snapshot: Vec<(u64, EventId)> =
+            map.iter().map(|(id, ts)| (*ts, *id)).collect();
+        save_processed_events(path, &snapshot);
     }
     tracing::info!(
-        loaded = set.len(),
+        loaded = map.len(),
         pruned = dropped,
         path = %path.display(),
         "processed_events dedup set loaded"
     );
-    set
+    map
 }
 
-/// Append one `(created_at, event_id)` entry to the processed-events
-/// log. Called after the handler runs (success or structured failure)
-/// so the next restart skips this event.
-fn append_processed_event(path: &std::path::Path, created_at: u64, id: &EventId) {
-    use std::io::Write;
-    let line = format!("{created_at} {}\n", id.to_hex());
-    let result = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .and_then(|mut f| f.write_all(line.as_bytes()));
-    if let Err(e) = result {
+/// Write the full processed-events set atomically. Called after every
+/// DM the handler completes, replacing the prior file contents. A
+/// crash at any point leaves either the old file or the new file — the
+/// exactly-once guard at the top of the handler tolerates either case.
+fn save_processed_events(path: &std::path::Path, entries: &[(u64, EventId)]) {
+    let mut sorted: Vec<&(u64, EventId)> = entries.iter().collect();
+    sorted.sort_by_key(|(ts, _)| *ts);
+    let mut body = String::with_capacity(sorted.len() * 80);
+    for (ts, id) in sorted {
+        body.push_str(&format!("{ts} {}\n", id.to_hex()));
+    }
+    if let Err(e) = write_file_atomic(path, body.as_bytes()) {
         tracing::warn!(
             error = %e,
             path = %path.display(),
-            "failed to append processed_events entry; this event may be reprocessed after restart"
+            "failed to persist processed_events atomically; exactly-once guarantee may degrade across the next restart"
         );
     }
 }
@@ -2059,7 +2136,7 @@ async fn try_channel_for_multi(
     validate_challenge(challenge, coordinator_npub)?;
 
     {
-        let s = state.lock().expect("state mutex poisoned");
+        let s = state.lock_state();
         let active_count = s.count_active_by_source_and_identifier(
             VerificationSource::LnChannel,
             node_id,
@@ -2104,7 +2181,7 @@ async fn try_channel_for_multi(
     );
     let vouch_output = client.send_event_builder(builder).await?;
     {
-        let mut s = state.lock().expect("state mutex poisoned");
+        let mut s = state.lock_state();
         s.vouches_published += 1;
         s.proofs_verified += 1;
         s.record_active_vouch(
@@ -2196,7 +2273,7 @@ async fn try_utxo_for_multi(
     let btc_hash = events::btc_address_hash(btc_address);
 
     {
-        let s = state.lock().expect("state mutex poisoned");
+        let s = state.lock_state();
         let active_count = s.count_active_by_source_and_identifier(
             VerificationSource::BtcUtxo,
             &btc_hash,
@@ -2228,7 +2305,7 @@ async fn try_utxo_for_multi(
     );
     let vouch_output = client.send_event_builder(builder).await?;
     {
-        let mut s = state.lock().expect("state mutex poisoned");
+        let mut s = state.lock_state();
         s.vouches_published += 1;
         s.proofs_verified += 1;
         s.record_active_vouch(
@@ -2300,7 +2377,7 @@ async fn try_peer_for_multi(
     validate_peer_challenge(challenge, coordinator_npub)?;
 
     {
-        let s = state.lock().expect("state mutex poisoned");
+        let s = state.lock_state();
         let active_count = s.count_active_by_source_and_identifier(
             VerificationSource::LnPeer,
             ln_node_id,
@@ -2327,7 +2404,7 @@ async fn try_peer_for_multi(
     );
     let vouch_output = client.send_event_builder(builder).await?;
     {
-        let mut s = state.lock().expect("state mutex poisoned");
+        let mut s = state.lock_state();
         s.vouches_published += 1;
         s.proofs_verified += 1;
         s.record_active_vouch(
@@ -2388,7 +2465,7 @@ async fn handle_multi_proof(
     audit_proof_type: &mut String,
 ) -> Result<()> {
     {
-        let mut s = state.lock().expect("state mutex poisoned");
+        let mut s = state.lock_state();
         s.proofs_received += 1;
     }
 
@@ -2397,8 +2474,7 @@ async fn handle_multi_proof(
         .context("format_invalid: missing proofs array")?;
     if proofs.is_empty() {
         state
-            .lock()
-            .expect("state mutex poisoned")
+            .lock_state()
             .proofs_rejected_format += 1;
         bail!("format_invalid: empty proofs array");
     }
@@ -2417,7 +2493,7 @@ async fn handle_multi_proof(
         ProofKind::Peer
     };
     {
-        let mut s = state.lock().expect("state mutex poisoned");
+        let mut s = state.lock_state();
         if let Err(e) = s.check_rate(sender, kind) {
             s.proofs_rate_limited += 1;
             return Err(e);
@@ -2431,7 +2507,7 @@ async fn handle_multi_proof(
         .as_str()
         .context("format_invalid: first proof has no challenge")?;
     {
-        let mut s = state.lock().expect("state mutex poisoned");
+        let mut s = state.lock_state();
         if let Err(e) = s.check_replay(sender, first_challenge) {
             s.proofs_replayed += 1;
             return Err(e);
@@ -2518,7 +2594,7 @@ async fn handle_multi_proof(
 
     // Every submitted proof failed.
     {
-        let mut s = state.lock().expect("state mutex poisoned");
+        let mut s = state.lock_state();
         s.proofs_rejected_signature += 1;
     }
     bail!("all_methods_failed: {}", errors.join("; "));
@@ -2541,13 +2617,13 @@ async fn handle_utxo_proof(
     audit_claimed_id: &mut String,
 ) -> Result<()> {
     {
-        let mut s = state.lock().expect("state mutex poisoned");
+        let mut s = state.lock_state();
         s.proofs_received += 1;
     }
 
     // Rate limit + replay cache (shared primitives).
     {
-        let mut s = state.lock().expect("state mutex poisoned");
+        let mut s = state.lock_state();
         if let Err(e) = s.check_rate(sender, ProofKind::ChainAnchored) {
             s.proofs_rate_limited += 1;
             return Err(e);
@@ -2590,15 +2666,13 @@ async fn handle_utxo_proof(
     // reject them, just slower.
     if !is_valid_txid(utxo_txid) {
         state
-            .lock()
-            .expect("state mutex poisoned")
+            .lock_state()
             .proofs_rejected_format += 1;
         bail!("format_invalid: utxo_txid must be 64 lowercase hex characters");
     }
     if !is_valid_btc_address(btc_address) {
         state
-            .lock()
-            .expect("state mutex poisoned")
+            .lock_state()
             .proofs_rejected_format += 1;
         bail!(
             "format_invalid: btc_address is not a recognized bitcoin address format"
@@ -2609,14 +2683,13 @@ async fn handle_utxo_proof(
     let coordinator_npub = keys.public_key().to_bech32()?;
     if let Err(e) = validate_utxo_challenge(challenge, &coordinator_npub) {
         state
-            .lock()
-            .expect("state mutex poisoned")
+            .lock_state()
             .proofs_rejected_format += 1;
         return Err(e);
     }
 
     {
-        let mut s = state.lock().expect("state mutex poisoned");
+        let mut s = state.lock_state();
         if let Err(e) = s.check_replay(sender, challenge) {
             s.proofs_replayed += 1;
             return Err(e);
@@ -2629,7 +2702,7 @@ async fn handle_utxo_proof(
     // only the hash, not the address).
     let btc_hash = events::btc_address_hash(btc_address);
     {
-        let s = state.lock().expect("state mutex poisoned");
+        let s = state.lock_state();
         let active_count = s.count_active_by_source_and_identifier(
             VerificationSource::BtcUtxo,
             &btc_hash,
@@ -2638,8 +2711,7 @@ async fn handle_utxo_proof(
         if active_count >= max_active_vouches_per_ln_node as usize {
             drop(s);
             state
-                .lock()
-                .expect("state mutex poisoned")
+                .lock_state()
                 .proofs_rejected_cap_hit += 1;
             bail!(
                 "vouch cap hit: bitcoin address (hash {btc_hash}) already has {active_count} active vouches (cap {max_active_vouches_per_ln_node})"
@@ -2653,8 +2725,7 @@ async fn handle_utxo_proof(
     // Cryptographic check: signature was made by the claimed address.
     if !verify_btc_signature(btc_dir, btc_address, signature, challenge)? {
         state
-            .lock()
-            .expect("state mutex poisoned")
+            .lock_state()
             .proofs_rejected_signature += 1;
         bail!(
             "signature verification failed: verifymessage returned false for address {btc_address}"
@@ -2665,7 +2736,7 @@ async fn handle_utxo_proof(
     let verified_balance_sat =
         check_utxo(btc_dir, utxo_txid, utxo_vout, btc_address, min_utxo_balance_sat)?;
 
-    state.lock().expect("state mutex poisoned").proofs_verified += 1;
+    state.lock_state().proofs_verified += 1;
 
     // Publish the vouch with NIP-40 expiration.
     let expires_at = Timestamp::now().as_secs() + vouch_expiry_days * 86400;
@@ -2679,7 +2750,7 @@ async fn handle_utxo_proof(
     );
     let vouch_output = client.send_event_builder(builder).await?;
     {
-        let mut s = state.lock().expect("state mutex poisoned");
+        let mut s = state.lock_state();
         s.vouches_published += 1;
         s.record_active_vouch(
             sender.to_hex(),
@@ -2741,12 +2812,12 @@ async fn handle_peer_proof(
     }
 
     {
-        let mut s = state.lock().expect("state mutex poisoned");
+        let mut s = state.lock_state();
         s.proofs_received += 1;
     }
 
     {
-        let mut s = state.lock().expect("state mutex poisoned");
+        let mut s = state.lock_state();
         if let Err(e) = s.check_rate(sender, ProofKind::Peer) {
             s.proofs_rate_limited += 1;
             return Err(e);
@@ -2769,8 +2840,7 @@ async fn handle_peer_proof(
         .collect();
     if addresses.is_empty() {
         state
-            .lock()
-            .expect("state mutex poisoned")
+            .lock_state()
             .proofs_rejected_format += 1;
         bail!("format_invalid: addresses array is empty");
     }
@@ -2779,14 +2849,13 @@ async fn handle_peer_proof(
     let coordinator_npub = keys.public_key().to_bech32()?;
     if let Err(e) = validate_peer_challenge(challenge, &coordinator_npub) {
         state
-            .lock()
-            .expect("state mutex poisoned")
+            .lock_state()
             .proofs_rejected_format += 1;
         return Err(e);
     }
 
     {
-        let mut s = state.lock().expect("state mutex poisoned");
+        let mut s = state.lock_state();
         if let Err(e) = s.check_replay(sender, challenge) {
             s.proofs_replayed += 1;
             return Err(e);
@@ -2796,7 +2865,7 @@ async fn handle_peer_proof(
     // Per-peer-pubkey cap check — tighter than channel/utxo because
     // peer has no chain anchor.
     {
-        let s = state.lock().expect("state mutex poisoned");
+        let s = state.lock_state();
         let active_count = s.count_active_by_source_and_identifier(
             VerificationSource::LnPeer,
             ln_node_id,
@@ -2805,8 +2874,7 @@ async fn handle_peer_proof(
         if active_count >= max_active_vouches_per_peer as usize {
             drop(s);
             state
-                .lock()
-                .expect("state mutex poisoned")
+                .lock_state()
                 .proofs_rejected_cap_hit += 1;
             bail!(
                 "vouch cap hit: peer {ln_node_id} already has {active_count} active peer-tier vouches (cap {max_active_vouches_per_peer})"
@@ -2821,14 +2889,13 @@ async fn handle_peer_proof(
         Ok(r) => r,
         Err(e) => {
             state
-                .lock()
-                .expect("state mutex poisoned")
+                .lock_state()
                 .proofs_rejected_signature += 1;
             return Err(e);
         }
     };
 
-    state.lock().expect("state mutex poisoned").proofs_verified += 1;
+    state.lock_state().proofs_verified += 1;
 
     // Publish the vouch.
     let expires_at = Timestamp::now().as_secs() + vouch_expiry_days * 86400;
@@ -2842,7 +2909,7 @@ async fn handle_peer_proof(
     );
     let vouch_output = client.send_event_builder(builder).await?;
     {
-        let mut s = state.lock().expect("state mutex poisoned");
+        let mut s = state.lock_state();
         s.vouches_published += 1;
         s.record_active_vouch(
             sender.to_hex(),
@@ -2969,8 +3036,7 @@ async fn handle_proof_request_core(
         Ok(p) => p,
         Err(e) => {
             state
-                .lock()
-                .expect("state mutex poisoned")
+                .lock_state()
                 .dms_decrypt_failed += 1;
             return Err(anyhow::anyhow!(
                 "failed to decrypt DM (not NIP-44 or not addressed to us): {}",
@@ -3055,13 +3121,13 @@ async fn handle_proof_request_core(
 
     // From this point we know it's a proof_of_channel request.
     {
-        let mut s = state.lock().expect("state mutex poisoned");
+        let mut s = state.lock_state();
         s.proofs_received += 1;
     }
 
     // Rate limit check (before doing any expensive crypto work)
     {
-        let mut s = state.lock().expect("state mutex poisoned");
+        let mut s = state.lock_state();
         if let Err(e) = s.check_rate(&sender, ProofKind::ChainAnchored) {
             s.proofs_rate_limited += 1;
             return Err(e);
@@ -3089,7 +3155,7 @@ async fn handle_proof_request_core(
     // Refuse to process anything until the vouch table has been loaded
     // from relays at startup. This prevents under-counting at cap check
     // time during the brief window before the initial sync completes.
-    if !state.lock().expect("state mutex poisoned").vouch_table_loaded {
+    if !state.lock_state().vouch_table_loaded {
         bail!("state_not_loaded: coordinator is still loading vouch table from relays, retry in a few seconds");
     }
 
@@ -3097,15 +3163,14 @@ async fn handle_proof_request_core(
     let coordinator_npub = keys.public_key().to_bech32()?;
     if let Err(e) = validate_challenge(challenge, &coordinator_npub) {
         state
-            .lock()
-            .expect("state mutex poisoned")
+            .lock_state()
             .proofs_rejected_format += 1;
         return Err(e);
     }
 
     // Replay check (same sender + challenge within 10 min => drop)
     {
-        let mut s = state.lock().expect("state mutex poisoned");
+        let mut s = state.lock_state();
         if let Err(e) = s.check_replay(&sender, challenge) {
             s.proofs_replayed += 1;
             return Err(e);
@@ -3116,7 +3181,7 @@ async fn handle_proof_request_core(
     // lookup. Safe pre-verification because the cap counts only our
     // own published vouches (authoritative), not the caller's claim.
     {
-        let s = state.lock().expect("state mutex poisoned");
+        let s = state.lock_state();
         let active_count = s.count_active_by_source_and_identifier(
             VerificationSource::LnChannel,
             node_id,
@@ -3125,8 +3190,7 @@ async fn handle_proof_request_core(
         if active_count >= max_active_vouches_per_ln_node as usize {
             drop(s);
             state
-                .lock()
-                .expect("state mutex poisoned")
+                .lock_state()
                 .proofs_rejected_cap_hit += 1;
             bail!(
                 "vouch cap hit: LN node {node_id} already has {active_count} active vouches (cap {max_active_vouches_per_ln_node})"
@@ -3158,15 +3222,13 @@ async fn handle_proof_request_core(
 
     if !verified {
         state
-            .lock()
-            .expect("state mutex poisoned")
+            .lock_state()
             .proofs_rejected_signature += 1;
         bail!("signature verification failed: checkmessage returned verified=false");
     }
     if recovered_pubkey != node_id {
         state
-            .lock()
-            .expect("state mutex poisoned")
+            .lock_state()
             .proofs_rejected_signature += 1;
         bail!(
             "node_id mismatch: claimed {} but signature recovers to {}",
@@ -3175,7 +3237,7 @@ async fn handle_proof_request_core(
         );
     }
 
-    state.lock().expect("state mutex poisoned").proofs_verified += 1;
+    state.lock_state().proofs_verified += 1;
 
     // Publish the vouch with NIP-40 expiration. Host must re-prove
     // before this window closes or the vouch is dropped by relays.
@@ -3190,7 +3252,7 @@ async fn handle_proof_request_core(
     );
     let vouch_output = client.send_event_builder(builder).await?;
     {
-        let mut s = state.lock().expect("state mutex poisoned");
+        let mut s = state.lock_state();
         s.vouches_published += 1;
         s.record_active_vouch(
             sender.to_hex(),
@@ -3396,7 +3458,7 @@ async fn sync_vouch_table(
 
     let count = fresh.len();
 
-    let mut guard = state.lock().expect("state mutex poisoned");
+    let mut guard = state.lock_state();
 
     // Log drift if this isn't the initial sync.
     if guard.vouch_table_loaded {
