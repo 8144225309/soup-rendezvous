@@ -1822,6 +1822,16 @@ struct DaemonState {
     /// notification handler dispatched with `created_at <= startup_now`.
     /// Purely observational.
     backlog_processed: u64,
+    /// Durable dedup set: event ids of every DM whose handler we've
+    /// run to completion (success or structured failure). Paired with
+    /// `processed_events.txt` so a restart never re-invokes the handler
+    /// for an event we already saw — no duplicate vouches, no duplicate
+    /// confirmation DMs. Entries older than PROCESSED_EVENTS_TTL_SECS
+    /// are pruned at startup.
+    processed_events: std::collections::HashSet<EventId>,
+    /// Count of events short-circuited because their id was already in
+    /// `processed_events`. Observability for the exactly-once path.
+    duplicates_skipped: u64,
 }
 
 /// One active vouch in the in-memory table. `identifier` is the
@@ -1872,7 +1882,7 @@ impl DaemonState {
     /// Render current counters as a single log-friendly string.
     fn metrics_summary(&self) -> String {
         format!(
-            "metrics: received={} verified={} vouches={} rejected_format={} rejected_sig={} rejected_cap={} rate_limited={} replayed={} decrypt_failed={} seen_cache={} tracked_senders={} vouch_table_size={} vouch_table_last_synced_at={} bucket_chain_anchored={}/{} bucket_peer={}/{} last_seen_dm={} backlog_processed={}",
+            "metrics: received={} verified={} vouches={} rejected_format={} rejected_sig={} rejected_cap={} rate_limited={} replayed={} decrypt_failed={} seen_cache={} tracked_senders={} vouch_table_size={} vouch_table_last_synced_at={} bucket_chain_anchored={}/{} bucket_peer={}/{} last_seen_dm={} backlog_processed={} processed_events_set={} duplicates_skipped={}",
             self.proofs_received,
             self.proofs_verified,
             self.vouches_published,
@@ -1892,6 +1902,8 @@ impl DaemonState {
             GLOBAL_PEER_HOURLY,
             self.last_seen_created_at,
             self.backlog_processed,
+            self.processed_events.len(),
+            self.duplicates_skipped,
         )
     }
 
@@ -1944,6 +1956,11 @@ const PER_SENDER_MINUTELY: usize = 1;
 const GLOBAL_CHAIN_ANCHORED_HOURLY: usize = 80;
 const GLOBAL_PEER_HOURLY: usize = 20;
 const REPLAY_TTL_SECS: u64 = 600; // 10 minutes
+
+/// How long we remember that a given event id was handled. Bounded so
+/// the dedup file doesn't grow forever; well past the challenge
+/// freshness window (5 min) and any plausible relay backlog.
+const PROCESSED_EVENTS_TTL_SECS: u64 = 7 * 24 * 3600; // 7 days
 
 /// Which global rate-limit bucket a proof request counts against.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2133,8 +2150,19 @@ async fn cmd_daemon(
     let keys = keys.clone();
     let ln_dir = lightning_dir.map(|p| p.to_path_buf());
     let btc_dir = bitcoin_dir.map(|p| p.to_path_buf());
+    // Load the durable event-id dedup set so we never re-invoke the
+    // handler for a DM we already processed. Paired with last_seen_dm:
+    // last_seen bounds the relay subscription window, processed_events
+    // dedupes any overlap within that window.
+    let processed_events_path = processed_events_path(key_file);
+    let processed_set = processed_events_path
+        .as_ref()
+        .map(|p| load_processed_events(p, startup_now))
+        .unwrap_or_default();
+
     let state = std::sync::Arc::new(std::sync::Mutex::new(DaemonState {
         last_seen_created_at: since_ts,
+        processed_events: processed_set,
         ..DaemonState::default()
     }));
 
@@ -2205,6 +2233,7 @@ async fn cmd_daemon(
             let btc_dir = btc_dir.clone();
             let state = state.clone();
             let last_seen_path = last_seen_path.clone();
+            let processed_events_path = processed_events_path.clone();
             async move {
                 if let RelayPoolNotification::Event { event, .. } = notification
                     && event.kind == Kind::Custom(4)
@@ -2212,13 +2241,37 @@ async fn cmd_daemon(
                 {
                     let event_ts = event.created_at.as_secs();
                     let is_backlog = event_ts < startup_now;
+
+                    // Durable exactly-once guard: if we've already run
+                    // the handler for this event id, short-circuit so
+                    // no duplicate vouch is published and no duplicate
+                    // confirmation DM is sent. Done before any work.
+                    let already_processed = {
+                        let s = state.lock().expect("state mutex poisoned");
+                        s.processed_events.contains(&event.id)
+                    };
+                    if already_processed {
+                        {
+                            let mut s = state.lock().expect("state mutex poisoned");
+                            s.duplicates_skipped += 1;
+                        }
+                        tracing::info!(
+                            sender = %event.pubkey,
+                            event_id = %event.id,
+                            event_ts,
+                            "skipping already-processed DM (exactly-once dedup hit)"
+                        );
+                        return Ok(false);
+                    }
+
                     if is_backlog {
                         let age = startup_now.saturating_sub(event_ts);
                         tracing::info!(
                             sender = %event.pubkey,
+                            event_id = %event.id,
                             event_ts,
                             age_seconds = age,
-                            "backlog DM replayed from offline window (will be processed; may reject as stale if challenge ts is outside 5-min window)"
+                            "backlog DM replayed from offline window (not yet processed; running handler)"
                         );
                     }
 
@@ -2240,12 +2293,12 @@ async fn cmd_daemon(
                         tracing::warn!(sender = %event.pubkey, error = %e, "request rejected");
                     }
 
-                    // Advance the persisted high-water mark whether the
-                    // request succeeded or failed — we've observed this
-                    // DM either way, and we don't want to re-process it
-                    // on the next restart.
-                    let persist = {
+                    // Record this event id as processed so a restart
+                    // never re-invokes the handler for it, then advance
+                    // the last_seen_dm high-water mark.
+                    let persist_last_seen = {
                         let mut s = state.lock().expect("state mutex poisoned");
+                        s.processed_events.insert(event.id);
                         if event_ts > s.last_seen_created_at {
                             s.last_seen_created_at = event_ts;
                             if is_backlog {
@@ -2256,7 +2309,10 @@ async fn cmd_daemon(
                             None
                         }
                     };
-                    if let (Some(ts), Some(path)) = (persist, &last_seen_path) {
+                    if let Some(path) = &processed_events_path {
+                        append_processed_event(path, event_ts, &event.id);
+                    }
+                    if let (Some(ts), Some(path)) = (persist_last_seen, &last_seen_path) {
                         save_last_seen_dm(path, ts);
                     }
                 }
@@ -2287,6 +2343,106 @@ fn save_last_seen_dm(path: &std::path::Path, ts: u64) {
             error = %e,
             path = %path.display(),
             "failed to persist last_seen_dm; offline-backlog resume after next restart may miss events"
+        );
+    }
+}
+
+/// Path of the persistent event-id dedup file, next to the key file.
+fn processed_events_path(key_file: &std::path::Path) -> Option<std::path::PathBuf> {
+    key_file.parent().map(|p| p.join("processed_events.txt"))
+}
+
+/// Read `processed_events.txt`, drop entries older than TTL, and return
+/// the surviving set. Also rewrites the file compacted if any pruning
+/// happened, so the file bounds over time. Any parse error on a single
+/// line is logged and that line skipped; the rest load.
+///
+/// Format: one entry per line, `<created_at_secs> <event_id_hex>`.
+fn load_processed_events(
+    path: &std::path::Path,
+    now: u64,
+) -> std::collections::HashSet<EventId> {
+    use std::collections::HashSet;
+    let mut set = HashSet::new();
+    let content = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return set,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                path = %path.display(),
+                "processed_events read failed; starting with empty set (restart may reprocess some DMs)"
+            );
+            return set;
+        }
+    };
+    let mut kept_lines: Vec<String> = Vec::new();
+    let mut dropped = 0u64;
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let mut parts = line.splitn(2, ' ');
+        let ts = match parts.next().and_then(|s| s.parse::<u64>().ok()) {
+            Some(t) => t,
+            None => continue,
+        };
+        let id_hex = match parts.next() {
+            Some(s) => s,
+            None => continue,
+        };
+        if now.saturating_sub(ts) >= PROCESSED_EVENTS_TTL_SECS {
+            dropped += 1;
+            continue;
+        }
+        let id = match EventId::from_hex(id_hex) {
+            Ok(id) => id,
+            Err(_) => continue,
+        };
+        set.insert(id);
+        kept_lines.push(format!("{ts} {id_hex}"));
+    }
+    if dropped > 0 {
+        let rewritten = kept_lines.join("\n");
+        let rewritten = if rewritten.is_empty() {
+            String::new()
+        } else {
+            format!("{rewritten}\n")
+        };
+        if let Err(e) = std::fs::write(path, rewritten) {
+            tracing::warn!(
+                error = %e,
+                path = %path.display(),
+                "processed_events compaction rewrite failed (non-fatal; set still loaded in memory)"
+            );
+        }
+    }
+    tracing::info!(
+        loaded = set.len(),
+        pruned = dropped,
+        path = %path.display(),
+        "processed_events dedup set loaded"
+    );
+    set
+}
+
+/// Append one `(created_at, event_id)` entry to the processed-events
+/// log. Called after the handler runs (success or structured failure)
+/// so the next restart skips this event.
+fn append_processed_event(path: &std::path::Path, created_at: u64, id: &EventId) {
+    use std::io::Write;
+    let line = format!("{created_at} {}\n", id.to_hex());
+    let result = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .and_then(|mut f| f.write_all(line.as_bytes()));
+    if let Err(e) = result {
+        tracing::warn!(
+            error = %e,
+            path = %path.display(),
+            "failed to append processed_events entry; this event may be reprocessed after restart"
         );
     }
 }
