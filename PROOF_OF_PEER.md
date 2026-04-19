@@ -121,7 +121,7 @@ In order (cheap first):
 
 1. `allow_peer_verification` is `true` for this coordinator instance. If not, reject immediately with `peer_verification_disabled`.
 2. Rate limit — peer bucket (20/hour) and per-sender (5/hour, 1/minute).
-3. Challenge has the right prefix, our npub, and the host-clock timestamp embedded in the challenge is within ±5 minutes of the coordinator's clock at verification. Hosts with NTP drift will see `challenge_expired`.
+3. Challenge has the right prefix, our npub, and passes the asymmetric freshness window: up to +5 min into the future (clock-skew tolerance) and up to 7 days into the past (so backlog DMs replayed after an outage still validate). Replay protection is provided separately by the 7-day `processed_events` dedup set.
 4. Replay cache: `(sender, challenge)` not seen in the last 10 minutes.
 5. **Per-peer-pubkey cap**: at most 3 active peer-tier vouches per LN node pubkey.
 6. `addresses` array is non-empty.

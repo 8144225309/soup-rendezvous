@@ -125,9 +125,15 @@ The only durable state files live next to `coordinator.nsec`:
 | `last_seen_dm.txt` | High-water mark of DM `created_at` so a restart subscribes `.since(ts)` and replays the offline backlog | No — but only loses the backlog window, not published vouches |
 | `processed_events.txt` | Exactly-once dedup set of DM event ids (7-day TTL, atomic writes) | No — worst case is a duplicate confirmation DM on one replayed request |
 
-**Offline tolerance.** Vouches carry NIP-40 expiration (14d mainnet, 30d test networks), so a coordinator offline longer than that comes back to an empty seed list naturally — every vouch the hosts would have had already expired at relays and on their own schedule. Hosts re-prove when they notice.
+**Offline tolerance.** The effective self-healing window is **7 days** — the maximum age of a DM the daemon will process after coming back online. Three cooperating mechanisms set this bound:
 
-**DM backlog scan clamp.** The `.since()` filter is clamped at **60 days** (`MAX_DM_LOOKBACK_SECS`). Any persisted `last_seen_dm` older than that floor is ignored — we start scanning from `now - 60d` instead of from the stale timestamp. 60d is ~4× the mainnet vouch expiry, so no useful recovery window is cut off; the clamp just bounds wasted decrypt work if the state file is stale, corrupt, or an adversary engineers a long-lookback request. Any DM older than ~5 minutes auto-rejects as `challenge_expired` before any expensive work regardless.
+- `PROCESSED_EVENTS_TTL_SECS = 7d` — dedup set of handled event ids, atomically persisted.
+- `CHALLENGE_PAST_WINDOW_SECS = 7d` — asymmetric challenge-freshness window: up to +5 min into the future (clock-skew tolerance) and up to 7d into the past (so backlog DMs arriving after restart still validate their proof-of-control against our clock).
+- Rate limits (per-sender, global chain/peer buckets) are **skipped for backlog DMs** — they're a real-time anti-flood defense; replaying a week of legitimate backlog in one burst shouldn't trip them.
+
+A coordinator offline up to 7 days comes back, replays every backlog DM it hasn't already responded to, and issues the corresponding vouches — no manual intervention, no host retries needed. Past 7 days, `processed_events` entries start aging out; a replayed DM whose entry has expired could trigger a duplicate confirmation DM (the vouch publish itself is still idempotent via replaceable d-tag), mild annoyance but not dangerous. Vouches themselves carry 14d (mainnet) / 30d (test) NIP-40 expiration — a coordinator offline past that comes back to an empty seed list naturally, every vouch having been purged at relays on its own schedule.
+
+**DM backlog scan clamp.** The `.since()` filter is clamped at **60 days** (`MAX_DM_LOOKBACK_SECS`). Any persisted `last_seen_dm` older than that floor is ignored — we start scanning from `now - 60d` instead of from the stale timestamp. 60d is wider than the 7d functional recovery window on purpose (no risk of cutting off useful recovery), while still bounding wasted decrypt work on stale or adversarial state-file inputs. Any backlog DM past the 7d freshness window still reaches the daemon but auto-rejects at the freshness check before any expensive verification.
 
 ## Multiple coordinators
 
