@@ -119,54 +119,57 @@ Fetch vouches for an advertisement's author:
 }]
 ```
 
-A vouch event contains:
+A vouch event has the same shape across all three tiers — only the
+`l` tag value differs:
+
 ```
 ["d",          "<host-nostr-pubkey-hex>"]   # parameterized-replaceable address
-["p",          "<host-nostr-pubkey-hex>"]
-["ln_node_id", "03abc..."]
-["l",          "channel"]                   # filterable proof-type tag
-["expiration", "1778966943"]                # NIP-40, 30 days after verified_at
+["p",          "<host-nostr-pubkey-hex>"]   # filterable by host
+["ln_node_id", "03abc..."]                  # the LN pubkey wallets dial
+["l",          "channel" | "utxo" | "peer"] # tier filter
+["btc_hash",   "<24-hex>"]                  # utxo-tier ONLY — daemon-internal cap key
+["expiration", "1778966943"]                # NIP-40, self-cleans
 ```
 ```json
 {
-  "status": "active",
-  "verification_source": "ln_channel",
-  "ln_node_id": "03abc...",
-  "channel_count": 12,
-  "capacity_sat": "50000000",
-  "verified_at": 1776374943,
-  "expires_at": 1778966943
+  "status":       "active",
+  "ln_node_id":   "03abc...",
+  "ln_addresses": ["host:9735"],            // OPTIONAL: only if not in BOLT-7 gossip
+  "verified_at":  1776374943,
+  "expires_at":   1778966943
 }
 ```
 
-The `["l", "channel"]` tag lets wallets filter at the relay layer
-for just proof-of-channel vouches via a standard NIP-01 filter:
-`{kinds:[38101], authors:[<coord>], "#l":["channel"]}`. The coordinator
-also publishes `["l", "utxo"]` vouches for hosts who proved an on-chain
-UTXO instead of a Lightning channel — see
-[PROOF_OF_UTXO.md](./PROOF_OF_UTXO.md). Both are chain-anchored.
-`verification_source` in content matches the tag and gives a
-human-readable name (`"ln_channel"` or `"btc_utxo"`).
+That's it. Channel topology, bitcoin balances, UTXO outpoints, and
+bitcoin addresses are verified by the coordinator and then deliberately
+stripped before publication — vouches carry only what wallets need to
+contact the host's LN node. Discover live factory state by dialing
+the host directly (see §6).
 
-### Three verification paths — one coordinator identity
+The `["l", ...]` tag lets wallets filter at the relay layer for one
+specific tier: `{kinds:[38101], authors:[<coord>], "#l":["channel"]}`.
+This is the primary defense against lower-tier abuse — a flood at
+peer-tier cannot contaminate a channel-tier query because filtering
+happens at the relay layer before bytes cross the wire.
+
+The `["btc_hash", ...]` tag only appears on utxo-tier vouches. It's
+a 12-byte SHA-256 of the verified bitcoin address used by the daemon
+to rebuild per-address Sybil cap state across restarts without
+publishing the address itself. Wallets ignore it.
+
+### Three verification paths — one coordinator identity, one vouch shape
 
 ```
 Filter: {kinds:[38101], authors:[<coord>], "#l":["channel"]}
   → hosts who proved an LN node with ≥1 announced channel
-  → content.verification_source == "ln_channel"
-  → content.ln_node_id is present
   → Sybil floor: cost of opening one LN channel (chain-anchored)
 
 Filter: {kinds:[38101], authors:[<coord>], "#l":["utxo"]}
   → hosts who proved control of an on-chain bitcoin address
-  → content.verification_source == "btc_utxo"
-  → content.btc_address and content.verified_balance_sat are present
   → Sybil floor: min_utxo_balance_sat (chain-anchored)
 
 Filter: {kinds:[38101], authors:[<coord>], "#l":["peer"]}
   → hosts who completed a BOLT-8 handshake with the coordinator
-  → content.verification_source == "ln_peer"
-  → content.peer_pubkey and content.peer_addresses are present
   → Sybil floor: cost of a reachable VPS (NOT chain-anchored)
 
 Filter: {kinds:[38101], authors:[<coord>], "#l":["channel","utxo"]}
@@ -175,6 +178,12 @@ Filter: {kinds:[38101], authors:[<coord>], "#l":["channel","utxo"]}
 Filter: {kinds:[38101], authors:[<coord>]}
   → everything including peer-tier (advanced / opt-in)
 ```
+
+All three tiers publish the **identical content shape**: status,
+ln_node_id, optional ln_addresses, verified_at, expires_at. The only
+distinguishing fields are the `l` tag value (tier) and (utxo-tier
+only) the daemon-internal `btc_hash` tag. Wallet code can read every
+vouch the same way regardless of tier.
 
 **Wallets SHOULD default to showing only chain-anchored tiers
 (`#l:["channel","utxo"]`) and expose peer-tier behind an explicit
@@ -223,24 +232,6 @@ Its `l` tag tells you exactly which tier was satisfied. If the host
 re-submits a multi-proof DM later and a stronger tier now verifies,
 the new vouch supersedes the prior one at the same d-tag.
 
-For a proof-of-utxo vouch, the content has extra fields:
-```json
-{
-  "status":               "active",
-  "verification_source":  "btc_utxo",
-  "btc_address":          "bc1q...",
-  "verified_balance_sat": "150000",
-  "utxo_txid":            "<64-hex>",
-  "utxo_vout":            0,
-  "verified_at":          1776374943,
-  "expires_at":           1778966943
-}
-```
-
-Wallets that want to apply their own additional balance threshold on
-top of the coordinator's configured floor can filter on
-`verified_balance_sat` client-side.
-
 The wallet checks (all must pass):
 1. Vouch author is in the wallet's accepted-coordinator list (user-configurable)
 2. Vouch `p` tag matches the advertisement author
@@ -258,11 +249,10 @@ The wallet checks (all must pass):
    points at a different LN node than the one the coordinator
    attested, refuse — the ad is either misconfigured or attempting
    to redirect the wallet to an LN node the host does not control.
-5a. **SHOULD deduplicate factory listings by the appropriate identifier
-    per method.**
-    - Channel vouches: dedup by `content.ln_node_id`.
-    - UTXO vouches: dedup by `content.btc_address`.
-    - Peer vouches: dedup by `content.peer_pubkey`.
+5a. **SHOULD deduplicate factory listings by `content.ln_node_id`.**
+    Every vouch in the unified format carries `ln_node_id` (the LN
+    pubkey to dial) regardless of tier, so dedup is the same across
+    tiers: collapse vouches that share an `ln_node_id` into one card.
 
     Because an operator can legitimately rotate Nostr keys per
     factory, the same underlying LSP may appear across multiple
@@ -285,8 +275,10 @@ The wallet checks (all must pass):
    unless the user explicitly opts into a "show all tiers" view — see
    [PROOF_OF_PEER.md](./PROOF_OF_PEER.md).
 6. **SHOULD verify the LN node exists in the current BOLT-7 gossip
-   graph** and its self-reported `channel_count` / `capacity_sat`
-   match what gossip reports. The coordinator already enforces a
+   graph** for channel-tier vouches. Recompute capacity, channel
+   count, and any other ranking signals from gossip directly — the
+   vouch deliberately doesn't republish those, since they would be
+   stale within minutes. The coordinator already enforces a
    gossip-existence check at vouch time via CLN's `checkmessage`
    (chain-anchored through channel_announcement signatures), so a
    vouched node was real when it was vouched. But vouch records are
@@ -308,54 +300,54 @@ A revoked vouch looks like:
 Display: **Vouched** (green) or **Unvouched** (yellow). Treat
 `status == "revoked"` the same as no vouch at all.
 
-### Vouch field reference — what each field is for
+### Vouch field reference — every field, every tier
 
-Every field in a vouch earns its place under one of three jobs:
-**contact** (how to reach the host over LN), **verifiability** (lets
-the wallet independently cross-check the coordinator's claim), or
-**ranking** (ordering signals for the UI).
+The unified vouch format publishes only what wallets need to contact
+the host's LN node. All other facts the coordinator verifies are
+stripped before publication, on purpose, to avoid leaking host-side
+topology, balances, or chain identifiers.
 
-| Field | Tier | Role | Stripped if gone? |
+| Field | Tier | Role | Required? |
 |---|---|---|---|
-| `d` tag (host pubkey hex) | all | identity + dedup | required |
-| `p` tag (host pubkey hex) | all | lets wallets query by host | required |
-| `l` tag (`channel`/`utxo`/`peer`) | all | relay-layer tier filter | required |
-| `expiration` tag + `expires_at` | all | NIP-40 self-cleaning freshness | required |
-| `status` (`active`/`revoked`) | all | revocation | required |
-| `verified_at` | all | audit trail | small, keep |
-| `ln_node_id` (content + custom tag) | channel | contact + gossip cross-check | **keep — contact** |
-| `channel_count` | channel | ranking | droppable — wallet can ask gossip |
-| `capacity_sat` | channel | ranking | droppable — wallet can ask gossip |
-| `btc_address` (content + custom tag) | utxo | verifiability (`gettxout` cross-check) | keep — chain-anchor proof |
-| `utxo_txid` / `utxo_vout` | utxo | verifiability | keep — same reason |
-| `verified_balance_sat` | utxo | ranking + wallet-side floor | keep — cheap, useful filter |
-| `peer_pubkey` (content + custom tag) | peer | contact | **keep — contact** |
-| `peer_addresses` | peer | contact (non-gossip endpoints) | keep if host isn't in LN gossip |
-| `features_hex` | peer | ranking | droppable |
+| `d` tag (host pubkey hex) | all | identity, parameterized-replaceable key | required |
+| `p` tag (host pubkey hex) | all | filterable: `"#p":[host]` | required |
+| `l` tag (`channel`/`utxo`/`peer`) | all | filterable tier label | required |
+| `ln_node_id` (custom tag + content) | all | the LN pubkey wallets dial | required |
+| `ln_addresses` (content) | all | host:port list (only if not in gossip) | optional |
+| `expiration` tag + `expires_at` (content) | all | NIP-40 self-cleaning freshness | required |
+| `status` (content) | all | `active` or `revoked` | required |
+| `verified_at` (content) | all | audit trail | small, kept |
+| `btc_hash` (custom tag) | utxo only | daemon-internal cap key (12-byte SHA-256 of the verified bitcoin address) — wallets ignore | required for utxo |
+| `revoked_at` (content) | revoked vouches | timestamp of revocation | present on revokes |
 
-### Known gap — utxo-tier vouches do not carry an LN contact
+What's deliberately NOT published (verified, then stripped):
 
-By design, the coordinator verifies that the host controls a specific
-bitcoin address and publishes exactly that claim. It does **not**
-attest anything about the host's LN node when operating in utxo-tier
-mode. A wallet that only reads the utxo-tier vouch has no way to
-know where to dial the host over LN.
+- `btc_address`, `utxo_txid`, `utxo_vout`, `verified_balance_sat` —
+  no public link from host to bitcoin address, UTXO outpoint, or
+  on-chain balance. The coordinator verified the chain-anchor; you
+  trust the coordinator's signature for that fact.
+- `channel_count`, `capacity_sat` — wallets recompute live from
+  BOLT-7 gossip when ranking.
+- `features_hex`, `peer_addresses` (peer-tier under old name) — peer
+  tier now uses the unified `ln_node_id`/`ln_addresses` naming.
+- `verification_source` — redundant with the `l` tag.
+- `reason` (revoke) — operator-side audit only, not republished.
 
-In the current architecture this is fine: wallets discover LN contact
-information from the host's own kind-38100 factory advertisement,
-which carries `lsp_pubkey` and the usual LN addresses. The vouch's
-job is "this host is real and paid a Sybil cost"; the ad's job is
-"here's how to reach me."
+### Trust model and the chain-anchor trade
 
-If a future wallet design wants to dial hosts directly from the vouch
-(skipping the ad), the utxo DM would need to include a host-declared
-`ln_node_id` that the coordinator passes through verbatim (no
-verification beyond format — the LN-node binding is separate from
-the UTXO proof). This change is not implemented today.
+The unified format made one explicit trust trade: **utxo-tier vouches
+no longer carry the bitcoin address or UTXO outpoint, so wallets
+cannot independently call `gettxout` to cross-check the coordinator's
+claim.** You're trusting the coordinator's signature that they did
+the chain check honestly.
 
-Channel-tier vouches do not have this gap: `ln_node_id` is the
-chain-anchored proof target, so it's always present. Peer-tier vouches
-do not have this gap either: `peer_pubkey` is itself the LN node id.
+Channel-tier still has a soft independent verifiability path: the
+`ln_node_id` is published, so wallets can confirm gossip membership
+themselves (gossip membership is itself the chain-anchor proof, free
+to verify). Peer-tier has no chain anchor by design and never did.
+
+If you need stronger guarantees for utxo-tier than coordinator
+signature alone, run your own coordinator instance.
 
 ### Challenge format security
 
@@ -589,15 +581,21 @@ Payload:
     },
     {
       "type": "proof_of_utxo",
-      "btc_address": "bc1q…",
-      "signature":   "H+sig…",
-      "challenge":   "soup-rendezvous:proof-of-utxo:v0:<coord>:<hex>:<ts>",
-      "utxo_txid":   "<64-hex>",
-      "utxo_vout":   0
+      "btc_address":  "bc1q…",
+      "signature":    "H+sig…",
+      "challenge":    "soup-rendezvous:proof-of-utxo:v0:<coord>:<hex>:<ts>",
+      "utxo_txid":    "<64-hex>",
+      "utxo_vout":    0,
+      "ln_node_id":   "03abc…",
+      "ln_addresses": ["host:9735"]
     }
   ]
 }
 ```
+
+`ln_node_id` is required for `proof_of_utxo` payloads (it's what
+wallets dial). `ln_addresses` is optional and only needed if the
+host's LN node isn't in BOLT-7 gossip.
 
 Rules:
 - The `proofs` array is ORDERED. Put the strongest proof first; the
@@ -619,7 +617,7 @@ Success response (coordinator → host DM):
   "type":           "vouch_confirmation",
   "vouch_event_id": "<hex-id>",
   "tier_used":      "channel" | "utxo" | "peer",
-  // plus the per-tier fields (node_id, btc_address, peer_pubkey, etc.)
+  "ln_node_id":     "03..." | "node_id": "03..."  // contact pubkey for the published vouch
   "message":        "vouched"
 }
 ```

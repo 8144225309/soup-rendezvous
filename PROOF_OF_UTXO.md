@@ -79,20 +79,26 @@ The encrypted DM carries:
 
 ```json
 {
-  "type":        "proof_of_utxo",
-  "btc_address": "bc1q...",
-  "signature":   "HzCvA...",          // bitcoin-cli signmessage output
-  "challenge":   "soup-rendezvous:proof-of-utxo:v0:<coord-npub>:<hex>:<ts>",
-  "utxo_txid":   "<64-hex>",
-  "utxo_vout":   0
+  "type":         "proof_of_utxo",
+  "btc_address":  "bc1q...",
+  "signature":    "HzCvA...",          // bitcoin-cli signmessage output
+  "challenge":    "soup-rendezvous:proof-of-utxo:v0:<coord-npub>:<hex>:<ts>",
+  "utxo_txid":    "<64-hex>",
+  "utxo_vout":    0,
+  "ln_node_id":   "03abc...",          // host-declared LN contact (NOT verified)
+  "ln_addresses": ["host:9735"]        // OPTIONAL: only if not in BOLT-7 gossip
 }
 ```
 
 `utxo_txid` and `utxo_vout` specify exactly which unspent output the host is using as proof. The coordinator uses these to query bitcoind directly — no wallet import or `scantxoutset` is required; `gettxout` reads the UTXO set in milliseconds.
 
-### What the utxo-tier vouch does NOT carry
+`ln_node_id` is **required** since the unified vouch format publishes contact pointers, not chain-anchored evidence. The coordinator does not verify the LN-node binding — its job is the UTXO chain anchor. A host who declares a wrong `ln_node_id` simply produces a vouch that no wallet can dial successfully, which invalidates the binding at the first dial at no protocol cost.
 
-The published vouch carries `btc_address`, `verified_balance_sat`, and the UTXO outpoint — everything a wallet needs to cross-check the coordinator's claim via `gettxout` and to apply its own balance floor. It does **not** carry an `ln_node_id`, because at this tier the coordinator has not verified anything about the host's Lightning node. Wallets that need LN contact information for a utxo-tier host obtain it from the host's kind-38100 factory advertisement (which carries `lsp_pubkey`), not from the vouch. See [WALLET_INTEGRATION.md §2 — Vouch field reference](./WALLET_INTEGRATION.md) for the full per-tier field table.
+### What the published utxo vouch carries
+
+The published vouch carries only the unified contact-pointer fields: `ln_node_id`, optional `ln_addresses`, status, expiration, and a daemon-internal `["btc_hash", ...]` tag (12-byte SHA-256 of the verified bitcoin address) used by the coordinator to rebuild per-address Sybil cap state on restart. Wallets ignore `btc_hash`.
+
+The `btc_address`, `utxo_txid`, `utxo_vout`, and `verified_balance_sat` are deliberately stripped from the published event so vouches don't expose host-side bitcoin addresses, UTXO outpoints, or balances. Wallets cannot independently call `gettxout` to cross-check the coordinator's chain-anchor claim — they're trusting the coordinator's signature for that. See [WALLET_INTEGRATION.md §2 — Trust model and the chain-anchor trade](./WALLET_INTEGRATION.md) for the full discussion.
 
 ## Coordinator checks
 

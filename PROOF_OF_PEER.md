@@ -34,7 +34,7 @@ Proof-of-channel requires an announced channel (real on-chain funding cost). Pro
 
 Proof-of-peer exists for the narrow case where a host has neither: a brand-new LSP bootstrapping a fresh node, a testnet operator who doesn't want to fund channels for the sake of attestation, or a protocol developer running experiments. The tier is useful but its guarantees are weaker.
 
-The coordinator honestly labels peer-tier vouches with `["l", "peer"]` and `"verification_source": "ln_peer"` so wallets can filter or warn. **Wallets SHOULD default to hiding peer-tier vouches** and show them only when the user explicitly opts in to the wider listing.
+The coordinator labels peer-tier vouches with `["l", "peer"]` so wallets can filter at the relay layer. **Wallets SHOULD default to hiding peer-tier vouches** and show them only when the user explicitly opts in to the wider listing.
 
 ## Sybil floor: weak
 
@@ -126,31 +126,35 @@ In order (cheap first):
 5. **Per-peer-pubkey cap**: at most 3 active peer-tier vouches per LN node pubkey.
 6. `addresses` array is non-empty.
 7. `lightning-cli connect <node_id>@<address>` succeeds against at least one advertised address.
-8. Publish vouch event with `verification_source: "ln_peer"` and `l: "peer"` tag.
+8. Publish vouch event with `["l", "peer"]` tag (unified format — see below).
 
 ## What the vouch contains
 
+Identical shape as channel and utxo vouches — only the `l` tag value differs:
+
 ```
-["d",           "<host-nostr-pubkey-hex>"]
-["p",           "<host-nostr-pubkey-hex>"]
-["peer_pubkey", "<ln-node-id-hex>"]
-["l",           "peer"]
-["expiration",  "<unix-ts>"]
+["d",          "<host-nostr-pubkey-hex>"]
+["p",          "<host-nostr-pubkey-hex>"]
+["ln_node_id", "<ln-node-id-hex>"]
+["l",          "peer"]
+["expiration", "<unix-ts>"]
 ```
 
 ```json
 {
-  "status":              "active",
-  "verification_source": "ln_peer",
-  "peer_pubkey":         "03...",
-  "peer_addresses":      ["host:9735", "ipv6.example.com:9735"],
-  "features_hex":        "080c8802",
-  "verified_at":         1776374943,
-  "expires_at":          1778966943
+  "status":       "active",
+  "ln_node_id":   "03...",
+  "ln_addresses": ["host:9735", "ipv6.example.com:9735"],
+  "verified_at":  1776374943,
+  "expires_at":   1778966943
 }
 ```
 
-`features_hex` is the LN feature bitmap advertised by the host during the BOLT-1 init exchange right after the handshake. It's informational — wallets can decode it if they care about specific feature support.
+For peer-tier the `ln_node_id` IS the verified peer pubkey (the BOLT-8 handshake confirms key possession). `ln_addresses` is included because peer-tier hosts may not be in BOLT-7 gossip — wallets need addresses to dial.
+
+The handshake observes feature bits during BOLT-1 init exchange but the bits are not republished — wallets re-observe them on first dial. Same rationale for everything else: the vouch is a contact pointer, not a profile.
+
+See [WALLET_INTEGRATION.md §2](./WALLET_INTEGRATION.md) for the full unified field reference and trust model.
 
 ## Wallet-side recommendation
 

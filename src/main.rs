@@ -245,6 +245,15 @@ enum Command {
         /// UTXO vout index.
         #[arg(long)]
         utxo_vout: u32,
+        /// LN node id (33-byte compressed pubkey, 66 hex chars). Required
+        /// since the unified vouch carries contact info; this is the node
+        /// wallets will dial to discover your factories.
+        #[arg(long)]
+        ln_node_id: String,
+        /// Optional comma-separated LN addresses (host:port) — only needed
+        /// if your LN node is not in BOLT-7 gossip.
+        #[arg(long)]
+        ln_addresses: Option<String>,
         /// Path to bitcoind data directory for signmessage.
         #[arg(long, env = "SOUP_BITCOIN_DIR")]
         bitcoin_dir: PathBuf,
@@ -290,6 +299,14 @@ enum Command {
         /// UTXO vout for proof-of-UTXO.
         #[arg(long)]
         utxo_vout: Option<u32>,
+        /// LN node id for proof-of-UTXO (host-declared contact, not
+        /// verified). Required when --include-utxo is set.
+        #[arg(long)]
+        utxo_ln_node_id: Option<String>,
+        /// Optional comma-separated LN addresses for the utxo-tier
+        /// vouch (only needed if your LN node is not in BOLT-7 gossip).
+        #[arg(long)]
+        utxo_ln_addresses: Option<String>,
         /// Bitcoind wallet name for signmessage (multi-wallet setups).
         #[arg(long)]
         bitcoin_wallet: Option<String>,
@@ -500,11 +517,17 @@ async fn main() -> Result<()> {
             btc_address,
             utxo_txid,
             utxo_vout,
+            ln_node_id,
+            ln_addresses,
             bitcoin_dir,
             bitcoin_wallet,
         } => {
             let keys = load_keys(&cli.key_file)?;
             let client = connect(&cli.relays, &keys, cli.proxy_url.as_deref()).await?;
+            let ln_addresses_vec: Vec<String> = ln_addresses
+                .as_deref()
+                .map(|s| s.split(',').map(str::trim).filter(|s| !s.is_empty()).map(String::from).collect())
+                .unwrap_or_default();
             cmd_request_vouch_utxo(
                 &client,
                 &keys,
@@ -512,6 +535,8 @@ async fn main() -> Result<()> {
                 &btc_address,
                 &utxo_txid,
                 utxo_vout,
+                &ln_node_id,
+                &ln_addresses_vec,
                 &bitcoin_dir,
                 bitcoin_wallet.as_deref(),
             )
@@ -543,11 +568,17 @@ async fn main() -> Result<()> {
             btc_address,
             utxo_txid,
             utxo_vout,
+            utxo_ln_node_id,
+            utxo_ln_addresses,
             bitcoin_wallet,
             peer_addresses,
         } => {
             let keys = load_keys(&cli.key_file)?;
             let client = connect(&cli.relays, &keys, cli.proxy_url.as_deref()).await?;
+            let utxo_ln_addresses_vec: Vec<String> = utxo_ln_addresses
+                .as_deref()
+                .map(|s| s.split(',').map(str::trim).filter(|s| !s.is_empty()).map(String::from).collect())
+                .unwrap_or_default();
             cmd_request_vouch_multi(
                 &client,
                 &keys,
@@ -560,6 +591,8 @@ async fn main() -> Result<()> {
                 btc_address.as_deref(),
                 utxo_txid.as_deref(),
                 utxo_vout,
+                utxo_ln_node_id.as_deref(),
+                &utxo_ln_addresses_vec,
                 bitcoin_wallet.as_deref(),
                 peer_addresses.as_deref(),
             )
@@ -755,16 +788,25 @@ async fn cmd_vouch(
         );
     }
 
-    // Publish the vouch event
+    // Publish the vouch event — unified format publishes only contact
+    // info (ln_node_id) plus tier/freshness; channels/capacity are
+    // accepted from the host but not republished.
     let expires_at = Timestamp::now().as_secs() + expiry_days * 86400;
-    let builder = events::build_vouch(&host_pk, node_id, channels, capacity_sat, expires_at);
+    let builder = events::build_vouch(
+        &host_pk,
+        events::VouchTier::Channel,
+        node_id,
+        &[],
+        None,
+        expires_at,
+    );
     let output = client.send_event_builder(builder).await?;
     println!("vouch published");
     println!("  event id:    {}", output.id());
     println!("  host nostr:  {}", host_pk);
     println!("  ln node:     {}", node_id);
-    println!("  channels:    {}", channels);
-    println!("  capacity:    {} sat", capacity_sat);
+    println!("  channels:    {} (verified, not republished)", channels);
+    println!("  capacity:    {} sat (verified, not republished)", capacity_sat);
     println!("  expires in:  {} days (host must re-prove before then)", expiry_days);
     Ok(())
 }
@@ -781,13 +823,17 @@ async fn cmd_revoke_vouch(
         PublicKey::from_hex(host_pubkey_str)?
     };
 
+    // Tier defaults to Channel for the published `l` tag — relays
+    // supersede on (kind, author, d-tag), so the published tier value
+    // doesn't gate replacement, but Channel is the historic default
+    // and any tier wins because the d-tag matches.
     let expires_at = Timestamp::now().as_secs() + expiry_days * 86400;
-    let builder = events::build_revoke_vouch(&host_pk, reason, expires_at);
+    let builder = events::build_revoke_vouch(&host_pk, events::VouchTier::Channel, expires_at);
     let output = client.send_event_builder(builder).await?;
     println!("vouch revoked");
     println!("  event id:   {}", output.id());
     println!("  host nostr: {}", host_pk);
-    println!("  reason:     {}", reason);
+    println!("  reason:     {} (operator-side audit only; not in published event)", reason);
     println!();
     println!("relays will supersede the prior 'active' vouch for this host.");
     Ok(())
@@ -1429,6 +1475,8 @@ async fn cmd_request_vouch_utxo(
     btc_address: &str,
     utxo_txid: &str,
     utxo_vout: u32,
+    ln_node_id: &str,
+    ln_addresses: &[String],
     bitcoin_dir: &std::path::Path,
     bitcoin_wallet: Option<&str>,
 ) -> Result<()> {
@@ -1472,15 +1520,21 @@ async fn cmd_request_vouch_utxo(
     }
     let signature = String::from_utf8_lossy(&sign_output.stdout).trim().to_string();
 
-    // Build the proof request payload.
-    let request = serde_json::json!({
+    // Build the proof request payload. ln_node_id is host-declared
+    // contact (not verified by the UTXO proof — first-dial failure
+    // invalidates a bad declaration at no protocol cost).
+    let mut request = serde_json::json!({
         "type": "proof_of_utxo",
         "btc_address": btc_address,
         "signature": signature,
         "challenge": challenge,
         "utxo_txid": utxo_txid,
         "utxo_vout": utxo_vout,
+        "ln_node_id": ln_node_id,
     });
+    if !ln_addresses.is_empty() {
+        request["ln_addresses"] = serde_json::json!(ln_addresses);
+    }
 
     // Encrypt + send as kind-4 DM.
     let encrypted = nip44::encrypt(
@@ -1599,6 +1653,8 @@ async fn cmd_request_vouch_multi(
     btc_address: Option<&str>,
     utxo_txid: Option<&str>,
     utxo_vout: Option<u32>,
+    utxo_ln_node_id: Option<&str>,
+    utxo_ln_addresses: &[String],
     bitcoin_wallet: Option<&str>,
     peer_addresses: Option<&str>,
 ) -> Result<()> {
@@ -1699,14 +1755,42 @@ async fn cmd_request_vouch_multi(
         }
         let signature = String::from_utf8_lossy(&sign_output.stdout).trim().to_string();
 
-        proofs.push(serde_json::json!({
+        // For multi-method DMs, if a channel proof is also being sent
+        // and the host didn't pass --utxo-ln-node-id, default to the
+        // channel's node id (same node, both proofs).
+        let utxo_node = match utxo_ln_node_id {
+            Some(s) => s.to_string(),
+            None => {
+                if include_channel && lightning_dir.is_some() {
+                    let info_output = std::process::Command::new("lightning-cli")
+                        .arg(format!("--lightning-dir={}", lightning_dir.unwrap().display()))
+                        .arg("getinfo")
+                        .output()
+                        .context("lightning-cli getinfo failed for utxo ln_node_id derivation")?;
+                    let info: serde_json::Value =
+                        serde_json::from_slice(&info_output.stdout).context("parse getinfo")?;
+                    info["id"].as_str().context("no id in getinfo")?.to_string()
+                } else {
+                    bail!(
+                        "--include-utxo requires --utxo-ln-node-id (the LN node wallets should dial), or pair with --include-channel + --lightning-dir for auto-detect"
+                    );
+                }
+            }
+        };
+
+        let mut p = serde_json::json!({
             "type": "proof_of_utxo",
             "btc_address": addr,
             "signature": signature,
             "challenge": challenge,
             "utxo_txid": txid,
             "utxo_vout": vout,
-        }));
+            "ln_node_id": utxo_node,
+        });
+        if !utxo_ln_addresses.is_empty() {
+            p["ln_addresses"] = serde_json::json!(utxo_ln_addresses);
+        }
+        proofs.push(p);
     }
 
     // Peer proof (weakest — placed last)
@@ -2649,7 +2733,14 @@ async fn try_channel_for_multi(
     }
 
     let expires_at = Timestamp::now().as_secs() + vouch_expiry_days * 86400;
-    let builder = events::build_vouch(sender, node_id, channels, capacity_sat, expires_at);
+    let builder = events::build_vouch(
+        sender,
+        events::VouchTier::Channel,
+        node_id,
+        &[],
+        None,
+        expires_at,
+    );
     let vouch_output = client.send_event_builder(builder).await?;
     {
         let mut s = state.lock().expect("state mutex poisoned");
@@ -2662,6 +2753,7 @@ async fn try_channel_for_multi(
             expires_at,
         );
     }
+    let _ = (channels, capacity_sat); // accepted in payload, not republished
     tracing::info!(
         sender = %sender,
         node_id = %node_id,
@@ -2719,6 +2811,17 @@ async fn try_utxo_for_multi(
     let utxo_vout = proof["utxo_vout"]
         .as_u64()
         .context("missing utxo_vout field")? as u32;
+    // Host-declared LN contact for the published vouch. NOT verified
+    // by the UTXO proof — the chain anchor is the bitcoin address. The
+    // host's word for which LN node to dial is enough for wallets;
+    // first-dial failure invalidates the binding at no cost.
+    let ln_node_id = proof["ln_node_id"]
+        .as_str()
+        .context("missing ln_node_id field (required since vouches are contact pointers)")?;
+    let ln_addresses: Vec<String> = proof["ln_addresses"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .unwrap_or_default();
 
     if !is_valid_txid(utxo_txid) {
         bail!("format_invalid: utxo_txid must be 64 lowercase hex characters");
@@ -2729,16 +2832,18 @@ async fn try_utxo_for_multi(
 
     validate_utxo_challenge(challenge, coordinator_npub)?;
 
+    let btc_hash = events::btc_address_hash(btc_address);
+
     {
         let s = state.lock().expect("state mutex poisoned");
         let active_count = s.count_active_by_source_and_identifier(
             VerificationSource::BtcUtxo,
-            btc_address,
+            &btc_hash,
             &sender.to_hex(),
         );
         if active_count >= max_active_vouches_per_ln_node as usize {
             bail!(
-                "vouch_cap_hit: bitcoin address {btc_address} already has {active_count} active vouches"
+                "vouch_cap_hit: bitcoin address (hash {btc_hash}) already has {active_count} active vouches"
             );
         }
     }
@@ -2752,12 +2857,12 @@ async fn try_utxo_for_multi(
         check_utxo(btc_dir, utxo_txid, utxo_vout, btc_address, min_utxo_balance_sat)?;
 
     let expires_at = Timestamp::now().as_secs() + vouch_expiry_days * 86400;
-    let builder = events::build_vouch_utxo(
+    let builder = events::build_vouch(
         sender,
-        btc_address,
-        verified_balance_sat,
-        utxo_txid,
-        utxo_vout,
+        events::VouchTier::Utxo,
+        ln_node_id,
+        &ln_addresses,
+        Some(&btc_hash),
         expires_at,
     );
     let vouch_output = client.send_event_builder(builder).await?;
@@ -2768,14 +2873,15 @@ async fn try_utxo_for_multi(
         s.record_active_vouch(
             sender.to_hex(),
             VerificationSource::BtcUtxo,
-            btc_address.to_string(),
+            btc_hash.clone(),
             expires_at,
         );
     }
+    let _ = verified_balance_sat; // verified ≥ floor; not republished
     tracing::info!(
         sender = %sender,
-        btc_address = %btc_address,
-        verified_balance_sat,
+        btc_address_hash = %btc_hash,
+        ln_node_id = %ln_node_id,
         vouch_id = %vouch_output.id(),
         "utxo vouch published (via multi)"
     );
@@ -2784,8 +2890,7 @@ async fn try_utxo_for_multi(
         "type": "vouch_confirmation",
         "vouch_event_id": vouch_output.id().to_hex(),
         "tier_used": "utxo",
-        "btc_address": btc_address,
-        "verified_balance_sat": verified_balance_sat.to_string(),
+        "ln_node_id": ln_node_id,
         "message": "vouched",
     });
     let encrypted = nip44::encrypt(
@@ -2851,11 +2956,12 @@ async fn try_peer_for_multi(
     let peer_result = try_peer_connect(ln_dir, ln_node_id, &addresses)?;
 
     let expires_at = Timestamp::now().as_secs() + vouch_expiry_days * 86400;
-    let builder = events::build_vouch_peer(
+    let builder = events::build_vouch(
         sender,
+        events::VouchTier::Peer,
         &peer_result.verified_pubkey,
         &addresses,
-        peer_result.features_hex.as_deref(),
+        None,
         expires_at,
     );
     let vouch_output = client.send_event_builder(builder).await?;
@@ -2870,9 +2976,10 @@ async fn try_peer_for_multi(
             expires_at,
         );
     }
+    let _ = peer_result.features_hex; // observed during handshake, not republished
     tracing::info!(
         sender = %sender,
-        peer_pubkey = %peer_result.verified_pubkey,
+        ln_node_id = %peer_result.verified_pubkey,
         addresses = ?addresses,
         vouch_id = %vouch_output.id(),
         "peer vouch published (via multi)"
@@ -2882,8 +2989,7 @@ async fn try_peer_for_multi(
         "type": "vouch_confirmation",
         "vouch_event_id": vouch_output.id().to_hex(),
         "tier_used": "peer",
-        "peer_pubkey": peer_result.verified_pubkey,
-        "features_hex": peer_result.features_hex,
+        "ln_node_id": peer_result.verified_pubkey,
         "message": "vouched",
     });
     let encrypted = nip44::encrypt(
@@ -3104,6 +3210,18 @@ async fn handle_utxo_proof(
     let utxo_vout = request["utxo_vout"]
         .as_u64()
         .context("missing utxo_vout field (expected u32)")? as u32;
+    // Host-declared LN contact for the published vouch. Required as
+    // of the unified-vouch format — vouches are contact pointers and
+    // utxo-tier needs an LN node to dial. Not verified here (the chain
+    // anchor is the bitcoin address); first-dial failure invalidates
+    // a bad declaration at no protocol cost.
+    let ln_node_id = request["ln_node_id"]
+        .as_str()
+        .context("missing ln_node_id field (required since vouches are contact pointers)")?;
+    let ln_addresses: Vec<String> = request["ln_addresses"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .unwrap_or_default();
 
     // Format-validate before spending any subprocess work. These
     // checks are cheap and reject malformed inputs in microseconds
@@ -3144,12 +3262,16 @@ async fn handle_utxo_proof(
         }
     }
 
-    // Per-bitcoin-address cap check BEFORE subprocess work.
+    // Per-bitcoin-address cap check BEFORE subprocess work. Uses a
+    // truncated SHA-256 of the address as the cap key so the in-memory
+    // and on-relay views stay consistent (the published vouch carries
+    // only the hash, not the address).
+    let btc_hash = events::btc_address_hash(btc_address);
     {
         let s = state.lock().expect("state mutex poisoned");
         let active_count = s.count_active_by_source_and_identifier(
             VerificationSource::BtcUtxo,
-            btc_address,
+            &btc_hash,
             &sender.to_hex(),
         );
         if active_count >= max_active_vouches_per_ln_node as usize {
@@ -3159,7 +3281,7 @@ async fn handle_utxo_proof(
                 .expect("state mutex poisoned")
                 .proofs_rejected_cap_hit += 1;
             bail!(
-                "vouch cap hit: bitcoin address {btc_address} already has {active_count} active vouches (cap {max_active_vouches_per_ln_node})"
+                "vouch cap hit: bitcoin address (hash {btc_hash}) already has {active_count} active vouches (cap {max_active_vouches_per_ln_node})"
             );
         }
     }
@@ -3186,12 +3308,12 @@ async fn handle_utxo_proof(
 
     // Publish the vouch with NIP-40 expiration.
     let expires_at = Timestamp::now().as_secs() + vouch_expiry_days * 86400;
-    let builder = events::build_vouch_utxo(
+    let builder = events::build_vouch(
         sender,
-        btc_address,
-        verified_balance_sat,
-        utxo_txid,
-        utxo_vout,
+        events::VouchTier::Utxo,
+        ln_node_id,
+        &ln_addresses,
+        Some(&btc_hash),
         expires_at,
     );
     let vouch_output = client.send_event_builder(builder).await?;
@@ -3201,14 +3323,15 @@ async fn handle_utxo_proof(
         s.record_active_vouch(
             sender.to_hex(),
             VerificationSource::BtcUtxo,
-            btc_address.to_string(),
+            btc_hash.clone(),
             expires_at,
         );
     }
+    let _ = (utxo_txid, utxo_vout, verified_balance_sat); // verified, not republished
     tracing::info!(
         sender = %sender,
-        btc_address = %btc_address,
-        verified_balance_sat,
+        btc_address_hash = %btc_hash,
+        ln_node_id = %ln_node_id,
         vouch_id = %vouch_output.id(),
         "utxo vouch published"
     );
@@ -3217,8 +3340,7 @@ async fn handle_utxo_proof(
     let confirmation = serde_json::json!({
         "type": "vouch_confirmation",
         "vouch_event_id": vouch_output.id().to_hex(),
-        "btc_address": btc_address,
-        "verified_balance_sat": verified_balance_sat.to_string(),
+        "ln_node_id": ln_node_id,
         "message": "vouched",
     });
     let encrypted = nip44::encrypt(
@@ -3349,11 +3471,12 @@ async fn handle_peer_proof(
 
     // Publish the vouch.
     let expires_at = Timestamp::now().as_secs() + vouch_expiry_days * 86400;
-    let builder = events::build_vouch_peer(
+    let builder = events::build_vouch(
         sender,
+        events::VouchTier::Peer,
         &peer_result.verified_pubkey,
         &addresses,
-        peer_result.features_hex.as_deref(),
+        None,
         expires_at,
     );
     let vouch_output = client.send_event_builder(builder).await?;
@@ -3367,9 +3490,10 @@ async fn handle_peer_proof(
             expires_at,
         );
     }
+    let _ = peer_result.features_hex.clone(); // observed during handshake, not republished
     tracing::info!(
         sender = %sender,
-        peer_pubkey = %peer_result.verified_pubkey,
+        ln_node_id = %peer_result.verified_pubkey,
         addresses = ?addresses,
         vouch_id = %vouch_output.id(),
         "peer vouch published"
@@ -3379,8 +3503,7 @@ async fn handle_peer_proof(
     let confirmation = serde_json::json!({
         "type": "vouch_confirmation",
         "vouch_event_id": vouch_output.id().to_hex(),
-        "peer_pubkey": peer_result.verified_pubkey,
-        "features_hex": peer_result.features_hex,
+        "ln_node_id": peer_result.verified_pubkey,
         "message": "vouched",
     });
     let encrypted = nip44::encrypt(
@@ -3696,7 +3819,14 @@ async fn handle_proof_request_core(
     // Publish the vouch with NIP-40 expiration. Host must re-prove
     // before this window closes or the vouch is dropped by relays.
     let expires_at = Timestamp::now().as_secs() + vouch_expiry_days * 86400;
-    let builder = events::build_vouch(&sender, node_id, channels, capacity_sat, expires_at);
+    let builder = events::build_vouch(
+        &sender,
+        events::VouchTier::Channel,
+        node_id,
+        &[],
+        None,
+        expires_at,
+    );
     let vouch_output = client.send_event_builder(builder).await?;
     {
         let mut s = state.lock().expect("state mutex poisoned");
@@ -3708,6 +3838,7 @@ async fn handle_proof_request_core(
             expires_at,
         );
     }
+    let _ = (channels, capacity_sat); // accepted in payload, not republished
     tracing::info!(
         sender = %sender,
         node_id = %node_id,
@@ -3842,25 +3973,50 @@ async fn sync_vouch_table(
             })
             .unwrap_or(VouchStatus::Active);
 
-        // verification_source: default to LnChannel for legacy events
-        // that were published before the field was introduced.
-        let source = content_v
-            .get("verification_source")
-            .and_then(|s| s.as_str())
-            .and_then(VerificationSource::from_content_str)
+        // Tier comes from the `["l", ...]` tag (the unified format
+        // dropped the redundant `verification_source` content field).
+        // Falls back to LnChannel for legacy events that predate either.
+        let source = event
+            .tags
+            .iter()
+            .find(|t| t.kind() == TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::L)))
+            .and_then(|t| t.content())
+            .and_then(events::VouchTier::from_l_tag)
+            .map(|t| match t {
+                events::VouchTier::Channel => VerificationSource::LnChannel,
+                events::VouchTier::Utxo => VerificationSource::BtcUtxo,
+                events::VouchTier::Peer => VerificationSource::LnPeer,
+            })
+            .or_else(|| {
+                content_v
+                    .get("verification_source")
+                    .and_then(|s| s.as_str())
+                    .and_then(VerificationSource::from_content_str)
+            })
             .unwrap_or(VerificationSource::LnChannel);
 
-        // Extract the identifier that matches the source.
+        // Extract the cap-tracking identifier per tier:
+        // - channel/peer: ln_node_id (same as the contact pubkey)
+        // - utxo: the daemon-internal `btc_hash` tag (truncated SHA-256
+        //   of the verified bitcoin address). Lets cap state survive
+        //   restarts without leaking the address. Legacy events with a
+        //   plaintext `btc_address` content field fall back to that.
         let identifier = match source {
-            VerificationSource::LnChannel => events::vouch_ln_node_id(&event),
-            VerificationSource::BtcUtxo => content_v
-                .get("btc_address")
-                .and_then(|v| v.as_str())
-                .map(String::from),
-            VerificationSource::LnPeer => content_v
-                .get("peer_pubkey")
-                .and_then(|v| v.as_str())
-                .map(String::from),
+            VerificationSource::LnChannel | VerificationSource::LnPeer => {
+                events::vouch_ln_node_id(&event).or_else(|| {
+                    // Legacy peer-tier events used "peer_pubkey" content key.
+                    content_v
+                        .get("peer_pubkey")
+                        .and_then(|v| v.as_str())
+                        .map(String::from)
+                })
+            }
+            VerificationSource::BtcUtxo => events::get_tag_value(&event, "btc_hash").or_else(|| {
+                content_v
+                    .get("btc_address")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+            }),
         };
         let Some(identifier) = identifier else {
             continue;
