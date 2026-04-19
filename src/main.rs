@@ -1401,6 +1401,25 @@ const REPLAY_TTL_SECS: u64 = 600; // 10 minutes
 /// freshness window (5 min) and any plausible relay backlog.
 const PROCESSED_EVENTS_TTL_SECS: u64 = 7 * 24 * 3600; // 7 days
 
+/// Upper bound on how far back the daemon will scan for DM backlog at
+/// startup. On boot we replay kind-4 DMs `.since(last_seen_dm)`, but
+/// if the persisted timestamp is older than this floor we clamp to
+/// `now - MAX_DM_LOOKBACK_SECS` instead.
+///
+/// Why a clamp: any backlog DM older than a few minutes will auto-
+/// reject as `challenge_expired` (the ±5min challenge freshness check
+/// runs before any work), so scanning months back is pure wasted
+/// decrypt cost. The clamp bounds that waste for three cases:
+/// 1. Long downtime — vouches have expired anyway (14d mainnet,
+///    30d test networks), so coordinator state is already effectively
+///    a cold start past this window.
+/// 2. Corrupt or tampered `last_seen_dm.txt`.
+/// 3. Adversarial request to flood the daemon with historical backlog.
+///
+/// 60 days is ~4× mainnet vouch expiry, so any useful recovery window
+/// is safely inside this clamp.
+const MAX_DM_LOOKBACK_SECS: u64 = 60 * 24 * 3600; // 60 days
+
 /// Which global rate-limit bucket a proof request counts against.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProofKind {
@@ -1567,12 +1586,21 @@ async fn cmd_daemon(
     // Resume from the last DM timestamp we persisted (if any) so a
     // restart picks up requests that arrived while we were down.
     // Re-processing an already-handled DM is benign: the 5-min challenge
-    // freshness window rejects stale ones, replayed ones are idempotent
-    // (same parameterized-replaceable d-tag), and the vouch table's
-    // cap check uses our own authoritative publishes.
+    // freshness window rejects stale ones immediately, replayed ones
+    // are idempotent (vouches share a d-tag → parameterized-replaceable
+    // supersession at relays), and cap checks live-query Nostr on every
+    // request so there is no in-memory state to go stale.
+    //
+    // The scan window is clamped at MAX_DM_LOOKBACK_SECS (60 days).
+    // Past that clamp, any DM still at a relay would carry a challenge
+    // timestamp older than our ±5min freshness window and would auto-
+    // reject as `challenge_expired` in under a millisecond — but we'd
+    // still pay the decrypt cost for each one. The clamp bounds how
+    // much pointless work we do on long downtime, on a stale state
+    // file, or in response to an adversarial lookback request.
     let last_seen_path = last_seen_dm_path(key_file);
     let startup_now = Timestamp::now().as_secs();
-    let since_ts = match last_seen_path
+    let raw_since_ts = match last_seen_path
         .as_ref()
         .and_then(|p| load_last_seen_dm(p).map(|ts| (p, ts)))
     {
@@ -1599,6 +1627,18 @@ async fn cmd_daemon(
             }
             startup_now
         }
+    };
+    let floor_ts = startup_now.saturating_sub(MAX_DM_LOOKBACK_SECS);
+    let since_ts = if raw_since_ts < floor_ts {
+        tracing::warn!(
+            raw_since_ts,
+            floor_ts,
+            max_lookback_days = MAX_DM_LOOKBACK_SECS / 86400,
+            "clamping DM scan window: persisted last_seen_dm is older than max lookback; entries before the clamp are discarded"
+        );
+        floor_ts
+    } else {
+        raw_since_ts
     };
 
     let filter = Filter::new()
