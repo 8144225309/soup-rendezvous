@@ -79,7 +79,7 @@ The coordinator bounds how many simultaneously-active vouches it will issue per 
 
 Caps block a single underlying identity from flooding the list by rotating Nostr keys. Only **active, unexpired** vouches count toward the cap — when a vouch expires naturally, the slot is freed automatically. Re-applying with the same Nostr key is cap-neutral (the replaceable d-tag supersedes the old entry).
 
-For utxo-tier the cap is keyed on a 12-byte SHA-256 of the verified bitcoin address, stored in a daemon-internal `["btc_hash", ...]` tag. Lets the coordinator enforce per-address Sybil caps across restarts without ever publishing the address itself. Wallets ignore that tag.
+For utxo-tier the cap is keyed on a 12-byte SHA-256 of the verified bitcoin address, stored in a daemon-internal `["btc_hash", ...]` tag. The coordinator enforces per-address Sybil caps by querying relays live on every proof request — Nostr is the single source of truth, no in-memory cap cache — so the hash on the published event is all the identifier anyone needs. Wallets ignore that tag.
 
 ## Split rate-limit buckets
 
@@ -109,6 +109,25 @@ Per-sender: 5/hour, 1/minute per Nostr pubkey. Applies uniformly to every method
 A flood at peer-tier literally cannot contaminate a tier-1 query result.
 
 **Young-peer safety: use multi-method DMs.** A freshly-funded LN channel won't be in the coordinator's BOLT-7 gossip view for minutes to hours after funding confirms. Any LSP that can produce more than one proof method SHOULD send a `proof_multi` DM rather than single-method. The coordinator cascades from channel → utxo → peer and publishes at the first that verifies — so a new operator who just opened their first channel still gets vouched immediately via the UTXO fallback while gossip catches up.
+
+## Coordinator state model
+
+The coordinator holds essentially no state of its own. **Nostr is the single source of truth** for which vouches are active — the daemon queries relays live on every cap check rather than keeping a local cache. This means:
+
+- No "vouch table" to get out of sync with reality.
+- Relay partition for minutes, hours, or even days is self-healing: the moment any relay becomes reachable again, the next proof request just works with fresh data. No circuit breaker, no startup blocking window, no manual intervention.
+- A proof arriving while zero relays are reachable is rejected with `state_unavailable` rather than risk publishing a vouch without a cap check.
+
+The only durable state files live next to `coordinator.nsec`:
+
+| File | Purpose | Rebuild if lost? |
+|---|---|---|
+| `last_seen_dm.txt` | High-water mark of DM `created_at` so a restart subscribes `.since(ts)` and replays the offline backlog | No — but only loses the backlog window, not published vouches |
+| `processed_events.txt` | Exactly-once dedup set of DM event ids (7-day TTL, atomic writes) | No — worst case is a duplicate confirmation DM on one replayed request |
+
+**Offline tolerance.** Vouches carry NIP-40 expiration (14d mainnet, 30d test networks), so a coordinator offline longer than that comes back to an empty seed list naturally — every vouch the hosts would have had already expired at relays and on their own schedule. Hosts re-prove when they notice.
+
+**DM backlog scan clamp.** The `.since()` filter is clamped at **60 days** (`MAX_DM_LOOKBACK_SECS`). Any persisted `last_seen_dm` older than that floor is ignored — we start scanning from `now - 60d` instead of from the stale timestamp. 60d is ~4× the mainnet vouch expiry, so no useful recovery window is cut off; the clamp just bounds wasted decrypt work if the state file is stale, corrupt, or an adversary engineers a long-lookback request. Any DM older than ~5 minutes auto-rejects as `challenge_expired` before any expensive work regardless.
 
 ## Multiple coordinators
 

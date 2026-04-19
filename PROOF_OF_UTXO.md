@@ -96,7 +96,7 @@ The encrypted DM carries:
 
 ### What the published utxo vouch carries
 
-The published vouch carries only the unified contact-pointer fields: `ln_node_id`, optional `ln_addresses`, status, expiration, and a daemon-internal `["btc_hash", ...]` tag (12-byte SHA-256 of the verified bitcoin address) used by the coordinator to rebuild per-address Sybil cap state on restart. Wallets ignore `btc_hash`.
+The published vouch carries only the unified contact-pointer fields: `ln_node_id`, optional `ln_addresses`, status, expiration, and a daemon-internal `["btc_hash", ...]` tag (12-byte SHA-256 of the verified bitcoin address) used by the coordinator as the cap-check identifier. The coordinator counts active vouches per `btc_hash` via a live relay query on every proof request — no in-memory cap table to go stale or rebuild. Wallets ignore `btc_hash`.
 
 The `btc_address`, `utxo_txid`, `utxo_vout`, and `verified_balance_sat` are deliberately stripped from the published event so vouches don't expose host-side bitcoin addresses, UTXO outpoints, or balances. Wallets that want a stronger Sybil floor than any given coordinator's configured `min_utxo_balance_sat` should run their own coordinator or subscribe to one whose floor matches their threshold. Nothing in this layer ever puts wallet funds at risk — the worst case from a misbehaving coordinator is a wasted LN dial.
 
@@ -107,13 +107,13 @@ In order (cheap checks first):
 1. Request has `type: "proof_of_utxo"`.
 2. Challenge has the right prefix, coordinator npub, and the host-clock timestamp embedded in the challenge is within ±5 minutes of the coordinator's clock at verification. Hosts with NTP drift will see `challenge_expired`.
 3. Replay cache: `(sender, challenge)` not seen in the last 10 minutes.
-4. **Per-btc-address cap** (default 10 active vouches): cheap in-memory lookup. If at cap, reject before doing any subprocess work.
+4. **Per-btc-address cap** (default 10 active vouches): live relay query for this coordinator's own kind-38101 events, filtered to `l=utxo` + matching `btc_hash`. If at cap, reject before doing any subprocess work. If relays are unreachable, reject with `state_unavailable` rather than risk over-capping.
 5. `bitcoin-cli verifymessage` returns `true` for the provided `(btc_address, signature, challenge)` tuple.
 6. `bitcoin-cli gettxout` returns a UTXO record confirming:
    - the output exists and is unspent,
    - its scriptPubKey resolves to `btc_address`,
    - its value meets the configured `min_utxo_balance_sat`.
-7. Publish a vouch event and record it in the in-memory table.
+7. Publish a vouch event. Nothing is cached locally — the next cap check will re-discover it via relays.
 
 If any of 1–6 fails, the coordinator bails with a structured reason (logged via the audit line) and does not publish a vouch.
 
