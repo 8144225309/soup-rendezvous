@@ -733,8 +733,8 @@ The `zbase` field is what gets sent; the others are informational.
   "node_id":      "03abc…",           // from lightning-cli getinfo
   "zbase":        "d9rzo…",           // from step C
   "challenge":    "soup-rendezvous:proof-of-channel:v0:…",
-  "channels":     12,                 // optional, for metadata on the vouch
-  "capacity_sat": "50000000"          // optional, string to avoid JSON integer limits
+  "channels":     12,                 // optional, audit only — not in published vouch
+  "capacity_sat": "50000000"          // optional, audit only — not in published vouch
 }
 ```
 

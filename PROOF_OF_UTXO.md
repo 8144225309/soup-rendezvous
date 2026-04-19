@@ -131,7 +131,7 @@ min_utxo_balance_sat = 100000             # ~$60 per Sybil (recommended)
 
 `min_utxo_balance_sat = 0` is the permissive default: any unspent output, even dust, satisfies the threshold. For mainnet deployments you probably want a non-zero floor; `100000` (0.001 BTC) is a reasonable baseline.
 
-Wallets observe the coordinator's accepted balance in the vouch's `verified_balance_sat` content field and can apply their own additional filter if they want stronger guarantees than the coordinator's floor provides.
+The coordinator's `min_utxo_balance_sat` is the only on-chain floor wallets get under the unified vouch format — `verified_balance_sat` is verified at proof time but no longer republished. Wallets that need a higher Sybil floor than a given coordinator's default should pick a coordinator whose configured floor matches their threshold, or run their own.
 
 ## Security checklist
 
