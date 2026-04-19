@@ -19,7 +19,7 @@ Six Nostr event kinds handle the full lifecycle:
 | 38200 | attestation | encrypted | joiner requests to join (NIP-44 encrypted to host) |
 | 38300 | seal | encrypted | host closes the cohort (NIP-44 encrypted to each member) |
 
-Vouch events are differentiated by a filterable `["l", "channel"|"utxo"|"peer"]` tag and a `"verification_source"` content field. See the [Spam resistance](#spam-resistance) section below for the three verification methods.
+Vouch events are unified across tiers and carry only the LN contact info wallets need to dial the host (`ln_node_id` + optional `ln_addresses`), the tier label (`["l", ...]` tag), freshness, and active/revoked status. Everything else (channel topology, bitcoin balances, UTXO outpoints, addresses) is verified by the coordinator and then deliberately stripped before publication so vouches don't leak host-side topology or financial info. Wallets discover factory state by dialing the host's LN node directly. See [Spam resistance](#spam-resistance) for the verification methods and [WALLET_INTEGRATION.md §2](./WALLET_INTEGRATION.md) for the full vouch field reference.
 
 A **coordinator** publishes a root discovery thread and vouches for factory hosts after verifying their identity via one of three methods. Wallets browse advertisements, check vouches, and join by publishing encrypted attestations. When the host seals the cohort, each member receives an encrypted manifest with the full member list and connection info. The seal is the handoff — after it, the wallet peers with the LSP over Lightning and all signing, state updates, and factory operations flow over the direct LN connection (custommsg 33001). Nostr is not involved after the seal.
 
@@ -41,8 +41,10 @@ The coordinator bounds how many simultaneously-active vouches it will issue per 
 | Method | Identifier | Default cap | Knob |
 |---|---|---|---|
 | channel | LN node pubkey | 10 | `max_active_vouches_per_ln_node` (also `SOUP_MAX_ACTIVE_VOUCHES_PER_LN_NODE`) |
-| utxo | Bitcoin address | 10 | same knob as channel |
+| utxo | truncated SHA-256 of bitcoin address | 10 | same knob as channel |
 | peer | LN peer pubkey | 3 | `max_active_vouches_per_peer` (also `SOUP_MAX_ACTIVE_VOUCHES_PER_PEER`) |
+
+For utxo-tier the cap is keyed on a 12-byte SHA-256 hash of the verified bitcoin address, written to a daemon-internal `["btc_hash", ...]` tag on the published vouch. Lets the coordinator rebuild per-address cap state on restart without ever publishing the address itself. Wallets ignore that tag.
 
 Caps block a single underlying identity from flooding the attestation list by rotating Nostr keys — a cheap amplification attack at the Nostr layer where each fresh key yields another vouch event that every wallet has to ingest and filter.
 
@@ -106,7 +108,7 @@ Wallets filter unvouched advertisements by default. For chain-anchored tiers, sp
 
 **Young-peer safety: use multi-method DMs.** A freshly-funded LN channel won't be in the coordinator's BOLT-7 gossip view for minutes to hours after the funding transaction confirms. Any host that can produce more than one proof method SHOULD always send a `proof_multi` DM (see [WALLET_INTEGRATION.md §7.1a](./WALLET_INTEGRATION.md)) rather than single-method. The coordinator tries each proof in order and publishes at the first tier that verifies — so a new operator who just opened their first channel still gets vouched immediately via the UTXO fallback while gossip catches up. No back-and-forth required, no legitimate operator filtered out for being correct-and-fast.
 
-**How verification cascades and how wallets filter.** The coordinator only verifies what the host submits. With `proof_multi`, it tries each submitted proof in order and publishes **one vouch at the first tier that verifies**. A host therefore holds at most one active vouch per coordinator (d-tag = host pubkey hex), labeled with the tier that won. Because the tier label is a NIP-01 single-letter `l` tag, wallets filter tier-first at the relay layer: query `"#l":["channel"]` first, then `"#l":["utxo"]`, and `"#l":["peer"]` only behind an explicit opt-in. A flood at peer-tier cannot pollute a channel-tier query. See [WALLET_INTEGRATION.md §2](./WALLET_INTEGRATION.md) for the recommended discovery sequence, the per-tier field reference, and the note on the utxo-tier LN-contact gap.
+**How verification cascades and how wallets filter.** The coordinator only verifies what the host submits. With `proof_multi`, it tries each submitted proof in order and publishes **one vouch at the first tier that verifies**. A host therefore holds at most one active vouch per coordinator (d-tag = host pubkey hex), labeled with the tier that won. Every vouch — channel, utxo, or peer — carries the same minimal payload: the host's LN node id (so wallets know which node to dial), an optional address list (for hosts not in BOLT-7 gossip), the tier `l` tag, and freshness. Because the tier label is a NIP-01 single-letter `l` tag, wallets filter tier-first at the relay layer: query `"#l":["channel"]` first, then `"#l":["utxo"]`, and `"#l":["peer"]` only behind an explicit opt-in. A flood at peer-tier cannot pollute a channel-tier query. See [WALLET_INTEGRATION.md §2](./WALLET_INTEGRATION.md) for the recommended discovery sequence and the per-tier field reference.
 
 ## CLI tool
 

@@ -133,167 +133,128 @@ pub fn build_status_update(
         ))
 }
 
-/// Build a vouch event.
+/// Tier of a published vouch — encoded as the `["l", ...]` tag value
+/// so wallets can filter at the relay layer via NIP-01.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VouchTier {
+    /// proof-of-channel: chain-anchored via BOLT-7 gossip membership
+    Channel,
+    /// proof-of-utxo: chain-anchored via UTXO set
+    Utxo,
+    /// proof-of-peer: NOT chain-anchored
+    Peer,
+}
+
+impl VouchTier {
+    pub fn as_l_tag(&self) -> &'static str {
+        match self {
+            Self::Channel => "channel",
+            Self::Utxo => "utxo",
+            Self::Peer => "peer",
+        }
+    }
+
+    pub fn from_l_tag(s: &str) -> Option<Self> {
+        match s {
+            "channel" => Some(Self::Channel),
+            "utxo" => Some(Self::Utxo),
+            "peer" => Some(Self::Peer),
+            _ => None,
+        }
+    }
+}
+
+/// Build a vouch event — uniform shape across all three tiers.
 ///
 /// Kind 38101, parameterized-replaceable with d-tag = host pubkey hex.
-/// Republishing (e.g. to refresh channel counts, to renew ahead of
-/// expiry, or to revoke via [`build_revoke_vouch`]) automatically
-/// replaces the prior version.
+/// Republishing automatically replaces the prior version.
 ///
-/// `expiry_unix` attaches a NIP-40 expiration tag. Hosts are expected
-/// to re-prove before this passes; conformant relays will drop the
-/// event after, and conformant clients will ignore it even if a
-/// non-conformant relay still serves it.
+/// The published vouch carries **only what wallets need to contact the
+/// host's LN node**: the `ln_node_id` (LN pubkey to dial), an optional
+/// `ln_addresses` list (host:port pairs, only needed if the node isn't
+/// in BOLT-7 gossip), the tier label, and freshness metadata. All other
+/// fields the coordinator has knowledge of (btc_address, channel count,
+/// verified balance, feature bits, etc.) are deliberately stripped to
+/// avoid leaking host-side topology / financial info beyond what's
+/// necessary for contact.
+///
+/// `btc_address_hash` is utxo-tier only: the daemon writes a truncated
+/// SHA-256 of the verified bitcoin address into a `["btc_hash", ...]`
+/// tag so it can rebuild per-address cap state on startup without
+/// publishing the address itself. Wallets ignore this tag.
+///
+/// `expiry_unix` attaches a NIP-40 expiration tag. Hosts re-prove
+/// before this passes; conformant relays drop the event after, and
+/// conformant clients ignore it even if a non-conformant relay still
+/// serves it.
 pub fn build_vouch(
     host_pubkey: &PublicKey,
+    tier: VouchTier,
     ln_node_id: &str,
-    channel_count: u32,
-    capacity_sat: &str,
+    ln_addresses: &[String],
+    btc_address_hash: Option<&str>,
     expiry_unix: u64,
 ) -> EventBuilder {
-    let content = serde_json::json!({
+    let mut content = serde_json::json!({
         "status": "active",
-        "verification_source": "ln_channel",
         "ln_node_id": ln_node_id,
-        "channel_count": channel_count,
-        "capacity_sat": capacity_sat,
         "verified_at": Timestamp::now().as_secs(),
         "expires_at": expiry_unix,
     });
+    if !ln_addresses.is_empty() {
+        content["ln_addresses"] = serde_json::json!(ln_addresses);
+    }
 
-    EventBuilder::new(kinds::VOUCH, content.to_string())
+    let mut builder = EventBuilder::new(kinds::VOUCH, content.to_string())
         .tag(Tag::identifier(host_pubkey.to_hex()))
         .tag(Tag::public_key(*host_pubkey))
         .tag(Tag::custom(
             TagKind::custom("ln_node_id"),
             vec![ln_node_id.to_string()],
         ))
-        // Single-letter filterable tag so wallets can query by proof
-        // type via NIP-01 filters (#l). Patch B will add "utxo" and
-        // "peer" values for the two additional verification methods.
         .tag(Tag::custom(
             TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::L)),
-            vec!["channel".to_string()],
+            vec![tier.as_l_tag().to_string()],
         ))
-        .tag(Tag::expiration(Timestamp::from(expiry_unix)))
-}
+        .tag(Tag::expiration(Timestamp::from(expiry_unix)));
 
-/// Build a proof-of-UTXO vouch event.
-///
-/// Kind 38101, parameterized-replaceable with d-tag = host pubkey
-/// hex (identical to proof-of-channel vouches; wallets can still
-/// dedup by `(source, identifier)`). Tagged with `["l", "utxo"]` for
-/// relay-layer filtering; content carries `verification_source =
-/// "btc_utxo"`, the claimed bitcoin address, and the actual UTXO
-/// balance the coordinator observed at verification time.
-pub fn build_vouch_utxo(
-    host_pubkey: &PublicKey,
-    btc_address: &str,
-    verified_balance_sat: u64,
-    utxo_txid: &str,
-    utxo_vout: u32,
-    expiry_unix: u64,
-) -> EventBuilder {
-    let content = serde_json::json!({
-        "status": "active",
-        "verification_source": "btc_utxo",
-        "btc_address": btc_address,
-        "verified_balance_sat": verified_balance_sat.to_string(),
-        "utxo_txid": utxo_txid,
-        "utxo_vout": utxo_vout,
-        "verified_at": Timestamp::now().as_secs(),
-        "expires_at": expiry_unix,
-    });
-
-    EventBuilder::new(kinds::VOUCH, content.to_string())
-        .tag(Tag::identifier(host_pubkey.to_hex()))
-        .tag(Tag::public_key(*host_pubkey))
-        .tag(Tag::custom(
-            TagKind::custom("btc_address"),
-            vec![btc_address.to_string()],
-        ))
-        .tag(Tag::custom(
-            TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::L)),
-            vec!["utxo".to_string()],
-        ))
-        .tag(Tag::expiration(Timestamp::from(expiry_unix)))
-}
-
-/// Build a proof-of-peer vouch event.
-///
-/// Kind 38101, d-tag = host pubkey hex. Tagged `["l", "peer"]` for
-/// relay-layer filtering. Content carries `verification_source =
-/// "ln_peer"`, the peer's LN pubkey, their advertised addresses, and
-/// optionally the feature bits observed during the BOLT-8 init
-/// exchange.
-///
-/// Peer verification has **no chain anchor**. Wallets accepting
-/// peer-tier vouches should make that an opt-in user choice, not a
-/// default.
-pub fn build_vouch_peer(
-    host_pubkey: &PublicKey,
-    peer_pubkey: &str,
-    peer_addresses: &[String],
-    features_hex: Option<&str>,
-    expiry_unix: u64,
-) -> EventBuilder {
-    let mut content = serde_json::json!({
-        "status": "active",
-        "verification_source": "ln_peer",
-        "peer_pubkey": peer_pubkey,
-        "peer_addresses": peer_addresses,
-        "verified_at": Timestamp::now().as_secs(),
-        "expires_at": expiry_unix,
-    });
-    if let Some(feat) = features_hex {
-        content["features_hex"] = serde_json::json!(feat);
+    if let Some(h) = btc_address_hash {
+        // Daemon-internal cap-rebuild aid for utxo-tier. Truncated
+        // SHA-256 of the verified bitcoin address — preimage-resistant
+        // so wallets can't reverse it back to a public address. Not
+        // listed in the public field reference; wallets ignore it.
+        builder = builder.tag(Tag::custom(
+            TagKind::custom("btc_hash"),
+            vec![h.to_string()],
+        ));
     }
 
-    EventBuilder::new(kinds::VOUCH, content.to_string())
-        .tag(Tag::identifier(host_pubkey.to_hex()))
-        .tag(Tag::public_key(*host_pubkey))
-        .tag(Tag::custom(
-            TagKind::custom("peer_pubkey"),
-            vec![peer_pubkey.to_string()],
-        ))
-        .tag(Tag::custom(
-            TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::L)),
-            vec!["peer".to_string()],
-        ))
-        .tag(Tag::expiration(Timestamp::from(expiry_unix)))
+    builder
 }
 
 /// Build a vouch-revocation event.
 ///
 /// Kind 38101 with the same d-tag (host pubkey hex) as the original
-/// vouch — relays will supersede the prior "active" event with this
+/// vouch — relays supersede the prior "active" event with this
 /// "revoked" one. Clients MUST check `content.status` before trusting
-/// any vouch.
+/// any vouch. Carries the same NIP-40 expiration so it self-cleans.
 pub fn build_revoke_vouch(
     host_pubkey: &PublicKey,
-    reason: &str,
+    tier: VouchTier,
     expiry_unix: u64,
 ) -> EventBuilder {
     let content = serde_json::json!({
         "status": "revoked",
-        "verification_source": "ln_channel",
-        "reason": reason,
         "revoked_at": Timestamp::now().as_secs(),
         "expires_at": expiry_unix,
     });
 
-    // The revoke carries the same NIP-40 expiration as a normal vouch
-    // so it self-cleans from relays after 30 days. The active vouch it
-    // replaced shares the same d-tag, so when this revoke expires the
-    // end state is "no attestation at all" — which is what revocation
-    // means anyway. Without an expiration tag, revoke events would
-    // accumulate forever on relays.
     EventBuilder::new(kinds::VOUCH, content.to_string())
         .tag(Tag::identifier(host_pubkey.to_hex()))
         .tag(Tag::public_key(*host_pubkey))
         .tag(Tag::custom(
             TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::L)),
-            vec!["channel".to_string()],
+            vec![tier.as_l_tag().to_string()],
         ))
         .tag(Tag::expiration(Timestamp::from(expiry_unix)))
 }
@@ -354,6 +315,20 @@ pub fn vouch_is_active(event: &Event) -> bool {
 /// Extract the `ln_node_id` tag from a vouch event, if present.
 pub fn vouch_ln_node_id(event: &Event) -> Option<String> {
     get_tag_value(event, "ln_node_id")
+}
+
+/// Truncated SHA-256 of a bitcoin address, hex-encoded. Used in the
+/// utxo-tier vouch's daemon-internal `["btc_hash", ...]` tag so the
+/// daemon can rebuild per-address cap state at startup without
+/// publishing the address itself. 24 hex chars = 96 bits — far more
+/// than enough Sybil collision resistance, and short enough to keep
+/// vouches lean.
+pub fn btc_address_hash(btc_address: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(btc_address.as_bytes());
+    let full: [u8; 32] = h.finalize().into();
+    hex::encode(&full[..12])
 }
 
 // --- helpers for extracting tags from fetched events ---
