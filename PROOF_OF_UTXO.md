@@ -105,7 +105,7 @@ The `btc_address`, `utxo_txid`, `utxo_vout`, and `verified_balance_sat` are deli
 In order (cheap checks first):
 
 1. Request has `type: "proof_of_utxo"`.
-2. Challenge has the right prefix, coordinator npub, and the host-clock timestamp embedded in the challenge is within ±5 minutes of the coordinator's clock at verification. Hosts with NTP drift will see `challenge_expired`.
+2. Challenge has the right prefix, coordinator npub, and passes the asymmetric freshness window: up to +5 min into the future (clock-skew tolerance) and up to 7 days into the past (so backlog DMs replayed after an outage still validate). Replay protection is provided separately by the 7-day `processed_events` dedup set.
 3. Replay cache: `(sender, challenge)` not seen in the last 10 minutes.
 4. **Per-btc-address cap** (default 10 active vouches): live relay query for this coordinator's own kind-38101 events, filtered to `l=utxo` + matching `btc_hash`. If at cap, reject before doing any subprocess work. If relays are unreachable, reject with `state_unavailable` rather than risk over-capping.
 5. `bitcoin-cli verifymessage` returns `true` for the provided `(btc_address, signature, challenge)` tuple.

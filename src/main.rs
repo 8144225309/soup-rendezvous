@@ -1396,10 +1396,35 @@ const GLOBAL_CHAIN_ANCHORED_HOURLY: usize = 80;
 const GLOBAL_PEER_HOURLY: usize = 20;
 const REPLAY_TTL_SECS: u64 = 600; // 10 minutes
 
-/// How long we remember that a given event id was handled. Bounded so
-/// the dedup file doesn't grow forever; well past the challenge
-/// freshness window (5 min) and any plausible relay backlog.
+/// How long we remember that a given event id was handled. Bounds
+/// the dedup file size and defines the effective self-healing
+/// window: an outage shorter than this and the daemon resumes
+/// processing the backlog on restart without double-publishing
+/// anything. Past this, older processed entries age out and a
+/// replayed DM could re-trigger its handler (duplicate confirmation
+/// DM to the host; the vouch publish itself is idempotent via the
+/// replaceable d-tag).
 const PROCESSED_EVENTS_TTL_SECS: u64 = 7 * 24 * 3600; // 7 days
+
+/// Upper bound on how far past the current wall clock a host's
+/// challenge timestamp is allowed to sit. Clock skew between coord
+/// and host is the only legitimate source of a future-dated
+/// challenge; a few minutes covers that. Wider would let an
+/// attacker with a compromised key pre-stamp signatures dated into
+/// the future to extend their useful stockpile lifetime.
+const CHALLENGE_FUTURE_WINDOW_SECS: u64 = 300; // +5 min
+
+/// Upper bound on how far back the host's challenge timestamp may
+/// be. Deliberately wide — the daemon has to be able to process
+/// DMs it missed while offline, and every legitimate backlog DM
+/// carries a challenge timestamp from when the host sent it (hours
+/// or days old by the time we replay). `processed_events` exactly-
+/// once dedup keeps the old-stockpile attack bounded at the DM-
+/// identity level; vouch caps (live relay queries) bound it at the
+/// proof-of-control level. Matched to `PROCESSED_EVENTS_TTL_SECS`
+/// on purpose: the two windows together define the effective self-
+/// healing envelope.
+const CHALLENGE_PAST_WINDOW_SECS: u64 = PROCESSED_EVENTS_TTL_SECS; // 7 days
 
 /// Upper bound on how far back the daemon will scan for DM backlog at
 /// startup. On boot we replay kind-4 DMs `.since(last_seen_dm)`, but
@@ -1755,6 +1780,7 @@ async fn cmd_daemon(
                         &state,
                         vouch_expiry_days,
                         max_active_vouches_per_ln_node,
+                        is_backlog,
                     )
                     .await
                     {
@@ -1942,6 +1968,36 @@ fn save_processed_events(path: &std::path::Path, entries: &[(u64, EventId)]) {
     }
 }
 
+/// Check that a challenge's embedded timestamp is within the
+/// asymmetric freshness window: `CHALLENGE_FUTURE_WINDOW_SECS` into
+/// the future (clock-skew tolerance only), `CHALLENGE_PAST_WINDOW_SECS`
+/// into the past (the self-healing backlog window — matched to
+/// `PROCESSED_EVENTS_TTL_SECS` so processed-DM dedup is doing the
+/// work of bounding stockpile replay).
+fn check_challenge_freshness(challenge_ts: u64) -> Result<()> {
+    let now = Timestamp::now().as_secs();
+    if challenge_ts > now {
+        let skew_future = challenge_ts - now;
+        if skew_future > CHALLENGE_FUTURE_WINDOW_SECS {
+            bail!(
+                "challenge rejected: timestamp is {} seconds in the future (max {})",
+                skew_future,
+                CHALLENGE_FUTURE_WINDOW_SECS
+            );
+        }
+    } else {
+        let skew_past = now - challenge_ts;
+        if skew_past > CHALLENGE_PAST_WINDOW_SECS {
+            bail!(
+                "challenge expired: timestamp is {} seconds in the past (max {})",
+                skew_past,
+                CHALLENGE_PAST_WINDOW_SECS
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Validate a proof-of-channel challenge string. Returns Ok if valid,
 /// Err with a specific reason if not. Used by both cmd_vouch and
 /// the daemon's handle_proof_request.
@@ -1964,15 +2020,7 @@ fn validate_challenge(challenge: &str, expected_npub: &str) -> Result<()> {
         );
     }
     let challenge_ts: u64 = parts[5].parse().context("invalid timestamp in challenge")?;
-    let now = Timestamp::now().as_secs();
-    let skew = now.abs_diff(challenge_ts);
-    if skew > 300 {
-        bail!(
-            "challenge expired: timestamp is {} seconds from now (max 300)",
-            skew
-        );
-    }
-    Ok(())
+    check_challenge_freshness(challenge_ts)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1988,6 +2036,7 @@ async fn handle_proof_request(
     state: &std::sync::Arc<std::sync::Mutex<DaemonState>>,
     vouch_expiry_days: u64,
     max_active_vouches_per_ln_node: u32,
+    is_backlog: bool,
 ) -> Result<()> {
     let start = std::time::Instant::now();
     let sender = event.pubkey;
@@ -2006,6 +2055,7 @@ async fn handle_proof_request(
         state,
         vouch_expiry_days,
         max_active_vouches_per_ln_node,
+        is_backlog,
         &mut claimed_id,
         &mut proof_type,
     )
@@ -2420,6 +2470,7 @@ async fn handle_multi_proof(
     state: &std::sync::Arc<std::sync::Mutex<DaemonState>>,
     vouch_expiry_days: u64,
     max_active_vouches_per_ln_node: u32,
+    is_backlog: bool,
     audit_claimed_id: &mut String,
     audit_proof_type: &mut String,
 ) -> Result<()> {
@@ -2451,7 +2502,12 @@ async fn handle_multi_proof(
     } else {
         ProofKind::Peer
     };
-    {
+    // Rate limits are a real-time anti-flood defense. Backlog DMs
+    // already arrived naturally-paced; replaying them in a burst
+    // against a sliding wall-clock window would reject legitimate
+    // traffic. `processed_events` dedup still guarantees exactly-
+    // once, and vouch caps (live relay queries) still cap Sybils.
+    if !is_backlog {
         let mut s = state.lock_state();
         if let Err(e) = s.check_rate(sender, kind) {
             s.proofs_rate_limited += 1;
@@ -2573,6 +2629,7 @@ async fn handle_utxo_proof(
     state: &std::sync::Arc<std::sync::Mutex<DaemonState>>,
     vouch_expiry_days: u64,
     max_active_vouches_per_ln_node: u32,
+    is_backlog: bool,
     audit_claimed_id: &mut String,
 ) -> Result<()> {
     {
@@ -2580,8 +2637,9 @@ async fn handle_utxo_proof(
         s.proofs_received += 1;
     }
 
-    // Rate limit + replay cache (shared primitives).
-    {
+    // Rate limit (real-time only — see handle_multi_proof for rationale
+    // on skipping during backlog replay).
+    if !is_backlog {
         let mut s = state.lock_state();
         if let Err(e) = s.check_rate(sender, ProofKind::ChainAnchored) {
             s.proofs_rate_limited += 1;
@@ -2759,6 +2817,7 @@ async fn handle_peer_proof(
     sender: &PublicKey,
     state: &std::sync::Arc<std::sync::Mutex<DaemonState>>,
     vouch_expiry_days: u64,
+    is_backlog: bool,
     audit_claimed_id: &mut String,
 ) -> Result<()> {
     if !allow_peer_verification {
@@ -2772,7 +2831,8 @@ async fn handle_peer_proof(
         s.proofs_received += 1;
     }
 
-    {
+    // Rate limit (real-time only — see handle_multi_proof for rationale).
+    if !is_backlog {
         let mut s = state.lock_state();
         if let Err(e) = s.check_rate(sender, ProofKind::Peer) {
             s.proofs_rate_limited += 1;
@@ -2922,15 +2982,7 @@ fn validate_peer_challenge(challenge: &str, expected_npub: &str) -> Result<()> {
         );
     }
     let challenge_ts: u64 = parts[5].parse().context("invalid timestamp in challenge")?;
-    let now = Timestamp::now().as_secs();
-    let skew = now.abs_diff(challenge_ts);
-    if skew > 300 {
-        bail!(
-            "challenge expired: timestamp is {} seconds from now (max 300)",
-            skew
-        );
-    }
-    Ok(())
+    check_challenge_freshness(challenge_ts)
 }
 
 /// Validate a proof-of-UTXO challenge string. Same shape as the
@@ -2954,15 +3006,7 @@ fn validate_utxo_challenge(challenge: &str, expected_npub: &str) -> Result<()> {
         );
     }
     let challenge_ts: u64 = parts[5].parse().context("invalid timestamp in challenge")?;
-    let now = Timestamp::now().as_secs();
-    let skew = now.abs_diff(challenge_ts);
-    if skew > 300 {
-        bail!(
-            "challenge expired: timestamp is {} seconds from now (max 300)",
-            skew
-        );
-    }
-    Ok(())
+    check_challenge_freshness(challenge_ts)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2978,6 +3022,7 @@ async fn handle_proof_request_core(
     state: &std::sync::Arc<std::sync::Mutex<DaemonState>>,
     vouch_expiry_days: u64,
     max_active_vouches_per_ln_node: u32,
+    is_backlog: bool,
     audit_claimed_id: &mut String,
     audit_proof_type: &mut String,
 ) -> Result<()> {
@@ -3021,6 +3066,7 @@ async fn handle_proof_request_core(
                 state,
                 vouch_expiry_days,
                 max_active_vouches_per_ln_node,
+                is_backlog,
                 audit_claimed_id,
             )
             .await;
@@ -3037,6 +3083,7 @@ async fn handle_proof_request_core(
                 &sender,
                 state,
                 vouch_expiry_days,
+                is_backlog,
                 audit_claimed_id,
             )
             .await;
@@ -3056,6 +3103,7 @@ async fn handle_proof_request_core(
                 state,
                 vouch_expiry_days,
                 max_active_vouches_per_ln_node,
+                is_backlog,
                 audit_claimed_id,
                 audit_proof_type,
             )
@@ -3077,8 +3125,9 @@ async fn handle_proof_request_core(
         s.proofs_received += 1;
     }
 
-    // Rate limit check (before doing any expensive crypto work)
-    {
+    // Rate limit check (real-time only — see handle_multi_proof for
+    // rationale on skipping during backlog replay).
+    if !is_backlog {
         let mut s = state.lock_state();
         if let Err(e) = s.check_rate(&sender, ProofKind::ChainAnchored) {
             s.proofs_rate_limited += 1;

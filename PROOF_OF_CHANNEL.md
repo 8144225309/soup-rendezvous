@@ -72,7 +72,7 @@ soup-rendezvous:proof-of-channel:v0:npub1zgqcy07tv2gqu...s3wxurq:031799dbcc9b897
 | `v0` | Protocol version — allows format changes without breaking old implementations |
 | `<coordinator-npub>` | Binds the signature to a specific coordinator — prevents replay to a different coordinator |
 | `<random-hex>` | 16 bytes of cryptographic randomness — prevents pre-computation and prediction |
-| `<unix-timestamp>` | Freshness — coordinator rejects challenges where \|now − ts\| > 300 seconds. The `ts` is the host's wall-clock time at the moment it constructed the challenge; the `now` is the coordinator's wall-clock time at verification. Hosts with NTP drift beyond ±5 minutes will see their proofs bounce as `challenge_expired` — fix NTP. |
+| `<unix-timestamp>` | Freshness — asymmetric window. Coordinator rejects challenges where `ts > now + 300s` (future window: clock-skew tolerance only — anything further ahead is either broken NTP or an attempt to stockpile into the future). Coordinator accepts challenges where `now - ts <= 7 days` (past window: matches `PROCESSED_EVENTS_TTL_SECS` — lets the daemon recover from up to 7 days of downtime and reply to backlogged DMs without rejecting them as stale). Exactly-once replay protection comes from `processed_events` dedup, not from the freshness window. Hosts with clocks >5 min ahead see `challenge rejected: ... in the future`; coordinators processing >7-day-old backlog DMs see `challenge expired: ... in the past`. |
 
 ### Why host-constructed challenges are safe
 
@@ -80,7 +80,7 @@ A naive design would have the coordinator issue each challenge, but that adds a 
 
 - **Domain separation** means the format is only meaningful to this protocol; a signature produced for soup-rendezvous cannot be misinterpreted by another service.
 - **Coordinator binding** (the npub is inside the string) means a signature produced for coordinator A cannot be submitted to coordinator B.
-- **Freshness** (timestamp) means a host cannot precompute signatures and stockpile them — the coordinator rejects anything older than five minutes.
+- **Freshness** (timestamp) caps how far in the future a challenge can be dated (±5 min, clock-skew tolerance) and how far in the past (up to 7 days). The past window exists so a coordinator that was offline can process backlogged DMs when it comes back; replay protection proper is provided by the `processed_events` exactly-once dedup, which remembers every handled event id for 7 days across restarts.
 - **Uniqueness** (random bytes) means no two challenges collide even if two hosts happen to pick the same timestamp.
 
 What the coordinator does NOT need to remember: which challenges it "issued," because it issued none. It only validates the arriving string against the rules above, plus the gossip-membership check via `checkmessage`.
