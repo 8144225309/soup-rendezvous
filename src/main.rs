@@ -616,13 +616,17 @@ async fn cmd_vouch(
 
     // Cap the number of active vouches per LN node.
     let coordinator_pk = client.signer().await?.get_public_key().await?;
-    let active_count =
-        count_active_vouches_for_ln_node(client, &coordinator_pk, node_id, &host_pk.to_hex())
-            .await
-            .unwrap_or_else(|e| {
-                tracing::warn!(error = %e, "relay query failed, proceeding anyway (fail-open)");
-                0
-            });
+    let active_count = count_active_vouches_live(
+        client,
+        &coordinator_pk,
+        VerificationSource::LnChannel,
+        node_id,
+        &host_pk.to_hex(),
+    )
+    .await
+    .context(
+        "relay cap-check query failed; refusing to publish a vouch we cannot cap-check against",
+    )?;
     if active_count >= max_active_vouches_per_ln_node as usize {
         bail!(
             "too many active vouches for LN node {node_id}: {active_count} already exist (cap {max_active_vouches_per_ln_node}); revoke stale vouches or wait for them to expire"
@@ -664,17 +668,62 @@ async fn cmd_revoke_vouch(
         PublicKey::from_hex(host_pubkey_str)?
     };
 
-    // Tier defaults to Channel for the published `l` tag — relays
-    // supersede on (kind, author, d-tag), so the published tier value
-    // doesn't gate replacement, but Channel is the historic default
-    // and any tier wins because the d-tag matches.
-    let expires_at = Timestamp::now().as_secs() + expiry_days * 86400;
-    let builder = events::build_revoke_vouch(&host_pk, events::VouchTier::Channel, expires_at);
+    let coord_pk = client.signer().await?.get_public_key().await?;
+    let host_d_tag = host_pk.to_hex();
+    let now = Timestamp::now().as_secs();
+
+    // Read the prior vouch event so we can (1) stamp the revoke with
+    // the original's tier — a tier-filtered wallet subscription
+    // (`"#l":["utxo"]`) then sees the revoke through its own filter —
+    // and (2) set the revoke's NIP-40 expiration to one day past the
+    // original's expiration. Without this, a config that tightened
+    // vouch_expiry_days between publish and revoke could leave the
+    // revoke expiring before the vouch it revokes, so a conformant
+    // relay would drop the revoke while still serving the "active"
+    // event. +24h guarantees any client that could still see the
+    // original has a full day to also pick up the replacement.
+    let (tier, revoke_expires_at) = match fetch_prior_vouch(client, &coord_pk, &host_d_tag).await {
+        Some(ev) => {
+            let prior_tier = ev
+                .tags
+                .iter()
+                .find(|t| {
+                    t.kind()
+                        == TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::L))
+                })
+                .and_then(|t| t.content())
+                .and_then(events::VouchTier::from_l_tag)
+                .unwrap_or(events::VouchTier::Channel);
+            let prior_expires_at = ev
+                .tags
+                .iter()
+                .find(|t| t.kind() == TagKind::Expiration)
+                .and_then(|t| t.content())
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(now + expiry_days * 86400);
+            (prior_tier, prior_expires_at + 86400)
+        }
+        None => {
+            tracing::warn!(
+                host = %host_pk,
+                "could not fetch prior vouch for this host; revoke will use CLI-default tier and expiry"
+            );
+            (events::VouchTier::Channel, now + expiry_days * 86400)
+        }
+    };
+
+    let builder = events::build_revoke_vouch(&host_pk, tier, revoke_expires_at);
     let output = client.send_event_builder(builder).await?;
     println!("vouch revoked");
-    println!("  event id:   {}", output.id());
-    println!("  host nostr: {}", host_pk);
-    println!("  reason:     {} (operator-side audit only; not in published event)", reason);
+    println!("  event id:    {}", output.id());
+    println!("  host nostr:  {host_pk}");
+    println!("  tier:        {} (preserved from prior vouch)", tier.as_l_tag());
+    println!(
+        "  expires at:  {revoke_expires_at} (one day past the prior vouch's expiration)"
+    );
+    println!(
+        "  reason:      {reason} (operator-side audit only; not in published event)"
+    );
     println!();
     println!("relays will supersede the prior 'active' vouch for this host.");
     Ok(())
@@ -1257,18 +1306,6 @@ struct DaemonState {
     /// Oldest-first queue of seen entries with timestamps, for eviction
     seen_order: std::collections::VecDeque<(u64, [u8; 32])>,
 
-    /// Authoritative in-memory view of our own active vouches. Keyed
-    /// by d-tag (host Nostr pubkey hex). Populated at startup from a
-    /// relay query, then maintained incrementally on each publish or
-    /// revoke the daemon emits. Periodic re-sync catches drift.
-    active_vouches: std::collections::HashMap<String, ActiveVouch>,
-    /// True once the startup relay query has populated `active_vouches`.
-    /// Incoming proof requests are rejected with `state_not_loaded`
-    /// until this flips, so we never under-count at cap check time.
-    vouch_table_loaded: bool,
-    /// Unix timestamp of the most recent successful sync from relays.
-    vouch_table_last_synced_at: u64,
-
     // Observability counters (monotonic since daemon start)
     proofs_received: u64,
     proofs_verified: u64,
@@ -1304,28 +1341,14 @@ struct DaemonState {
     duplicates_skipped: u64,
 }
 
-/// One active vouch in the in-memory table. `identifier` is the
-/// thing being attested and differs per source (LN node pubkey for
-/// channel, bitcoin address for utxo, peer pubkey for peer).
-#[derive(Debug, Clone)]
-struct ActiveVouch {
-    source: VerificationSource,
-    identifier: String,
-    expires_at: u64,
-    status: VouchStatus,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum VouchStatus {
-    Active,
-    Revoked,
-}
-
+/// Tier of a published vouch — names the verification method the
+/// coordinator ran. Used for both cap-check dispatch (channel vs
+/// utxo vs peer) and audit-log labeling. Has nothing to do with
+/// on-disk state; the daemon holds no cap cache.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum VerificationSource {
     LnChannel,
     BtcUtxo,
-    #[allow(dead_code)] // populated by Patch B2 (proof-of-peer)
     LnPeer,
 }
 
@@ -1337,22 +1360,13 @@ impl VerificationSource {
             Self::LnPeer => "ln_peer",
         }
     }
-
-    fn from_content_str(s: &str) -> Option<Self> {
-        match s {
-            "ln_channel" => Some(Self::LnChannel),
-            "btc_utxo" => Some(Self::BtcUtxo),
-            "ln_peer" => Some(Self::LnPeer),
-            _ => None,
-        }
-    }
 }
 
 impl DaemonState {
     /// Render current counters as a single log-friendly string.
     fn metrics_summary(&self) -> String {
         format!(
-            "metrics: received={} verified={} vouches={} rejected_format={} rejected_sig={} rejected_cap={} rate_limited={} replayed={} decrypt_failed={} seen_cache={} tracked_senders={} vouch_table_size={} vouch_table_last_synced_at={} bucket_chain_anchored={}/{} bucket_peer={}/{} last_seen_dm={} backlog_processed={} processed_events_set={} duplicates_skipped={}",
+            "metrics: received={} verified={} vouches={} rejected_format={} rejected_sig={} rejected_cap={} rate_limited={} replayed={} decrypt_failed={} seen_cache={} tracked_senders={} bucket_chain_anchored={}/{} bucket_peer={}/{} last_seen_dm={} backlog_processed={} processed_events_set={} duplicates_skipped={}",
             self.proofs_received,
             self.proofs_verified,
             self.vouches_published,
@@ -1364,8 +1378,6 @@ impl DaemonState {
             self.dms_decrypt_failed,
             self.seen.len(),
             self.per_sender.len(),
-            self.active_vouches.len(),
-            self.vouch_table_last_synced_at,
             self.global_chain_anchored.len(),
             GLOBAL_CHAIN_ANCHORED_HOURLY,
             self.global_peer.len(),
@@ -1375,49 +1387,6 @@ impl DaemonState {
             self.processed_events.len(),
             self.duplicates_skipped,
         )
-    }
-
-    /// Count active vouches for a given (source, identifier) pair,
-    /// excluding the d-tag corresponding to the Nostr pubkey being
-    /// (re-)vouched. One cap primitive shared by every proof method.
-    fn count_active_by_source_and_identifier(
-        &self,
-        source: VerificationSource,
-        identifier: &str,
-        exclude_d_tag: &str,
-    ) -> usize {
-        let now = Timestamp::now().as_secs();
-        self.active_vouches
-            .iter()
-            .filter(|(d, v)| {
-                v.status == VouchStatus::Active
-                    && v.expires_at > now
-                    && v.source == source
-                    && v.identifier == identifier
-                    && d.as_str() != exclude_d_tag
-            })
-            .count()
-    }
-
-    /// Record a newly-published active vouch in the table, superseding
-    /// any prior entry under the same d-tag (parameterized-replaceable
-    /// semantics match ours on relays).
-    fn record_active_vouch(
-        &mut self,
-        d_tag: String,
-        source: VerificationSource,
-        identifier: String,
-        expires_at: u64,
-    ) {
-        self.active_vouches.insert(
-            d_tag,
-            ActiveVouch {
-                source,
-                identifier,
-                expires_at,
-                status: VouchStatus::Active,
-            },
-        );
     }
 }
 
@@ -1662,47 +1631,11 @@ async fn cmd_daemon(
         ..DaemonState::default()
     }));
 
-    // Initial sync of the in-memory vouch table from relays. Retries
-    // every 30s on failure so a transient relay issue doesn't leave
-    // the daemon permanently refusing requests with state_not_loaded.
-    {
-        let state = state.clone();
-        let client = client.clone();
-        tokio::spawn(async move {
-            loop {
-                match sync_vouch_table(&client, &coordinator_pk, &state).await {
-                    Ok(n) => {
-                        tracing::info!(
-                            vouch_table_size = n,
-                            "initial vouch table sync complete"
-                        );
-                        break;
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "initial vouch table sync failed, retrying in 30s");
-                        tokio::time::sleep(Duration::from_secs(30)).await;
-                    }
-                }
-            }
-        });
-    }
-
-    // Periodic vouch-table re-sync (every hour) to catch drift between
-    // the in-memory view and what relays actually hold.
-    {
-        let state = state.clone();
-        let client = client.clone();
-        tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(Duration::from_secs(3600));
-            ticker.tick().await; // skip the immediate first tick
-            loop {
-                ticker.tick().await;
-                if let Err(e) = sync_vouch_table(&client, &coordinator_pk, &state).await {
-                    tracing::warn!(error = %e, "periodic vouch table re-sync failed");
-                }
-            }
-        });
-    }
+    // No in-memory vouch cache to maintain — cap checks query relays
+    // live on every proof request. Nostr is the single source of truth.
+    // Self-healing falls out for free: if relays were briefly down,
+    // the next proof just re-queries; there's no stale cache to
+    // reconcile, no circuit breaker, no startup blocking window.
 
     // Spawn periodic metrics logger (every 60s)
     {
@@ -2135,18 +2068,18 @@ async fn try_channel_for_multi(
 
     validate_challenge(challenge, coordinator_npub)?;
 
-    {
-        let s = state.lock_state();
-        let active_count = s.count_active_by_source_and_identifier(
-            VerificationSource::LnChannel,
-            node_id,
-            &sender.to_hex(),
-        );
-        if active_count >= max_active_vouches_per_ln_node as usize {
-            bail!(
-                "vouch_cap_hit: LN node {node_id} already has {active_count} active vouches"
-            );
-        }
+    let coord_pk = keys.public_key();
+    let active_count = count_active_vouches_live(
+        client,
+        &coord_pk,
+        VerificationSource::LnChannel,
+        node_id,
+        &sender.to_hex(),
+    )
+    .await
+    .context("state_unavailable: could not query relays for cap check")?;
+    if active_count >= max_active_vouches_per_ln_node as usize {
+        bail!("vouch_cap_hit: LN node {node_id} already has {active_count} active vouches");
     }
 
     let ln_dir = lightning_dir.context("no lightning_dir configured")?;
@@ -2184,14 +2117,8 @@ async fn try_channel_for_multi(
         let mut s = state.lock_state();
         s.vouches_published += 1;
         s.proofs_verified += 1;
-        s.record_active_vouch(
-            sender.to_hex(),
-            VerificationSource::LnChannel,
-            node_id.to_string(),
-            expires_at,
-        );
     }
-    let _ = (channels, capacity_sat); // accepted in payload, not republished
+    let _ = (channels, capacity_sat, expires_at); // accepted in payload, not republished
     tracing::info!(
         sender = %sender,
         node_id = %node_id,
@@ -2272,18 +2199,20 @@ async fn try_utxo_for_multi(
 
     let btc_hash = events::btc_address_hash(btc_address);
 
-    {
-        let s = state.lock_state();
-        let active_count = s.count_active_by_source_and_identifier(
-            VerificationSource::BtcUtxo,
-            &btc_hash,
-            &sender.to_hex(),
+    let coord_pk = keys.public_key();
+    let active_count = count_active_vouches_live(
+        client,
+        &coord_pk,
+        VerificationSource::BtcUtxo,
+        &btc_hash,
+        &sender.to_hex(),
+    )
+    .await
+    .context("state_unavailable: could not query relays for cap check")?;
+    if active_count >= max_active_vouches_per_ln_node as usize {
+        bail!(
+            "vouch_cap_hit: bitcoin address (hash {btc_hash}) already has {active_count} active vouches"
         );
-        if active_count >= max_active_vouches_per_ln_node as usize {
-            bail!(
-                "vouch_cap_hit: bitcoin address (hash {btc_hash}) already has {active_count} active vouches"
-            );
-        }
     }
 
     let btc_dir =
@@ -2308,14 +2237,8 @@ async fn try_utxo_for_multi(
         let mut s = state.lock_state();
         s.vouches_published += 1;
         s.proofs_verified += 1;
-        s.record_active_vouch(
-            sender.to_hex(),
-            VerificationSource::BtcUtxo,
-            btc_hash.clone(),
-            expires_at,
-        );
     }
-    let _ = verified_balance_sat; // verified ≥ floor; not republished
+    let _ = (verified_balance_sat, expires_at); // verified ≥ floor; not republished
     tracing::info!(
         sender = %sender,
         btc_address_hash = %btc_hash,
@@ -2376,18 +2299,20 @@ async fn try_peer_for_multi(
 
     validate_peer_challenge(challenge, coordinator_npub)?;
 
-    {
-        let s = state.lock_state();
-        let active_count = s.count_active_by_source_and_identifier(
-            VerificationSource::LnPeer,
-            ln_node_id,
-            &sender.to_hex(),
+    let coord_pk = keys.public_key();
+    let active_count = count_active_vouches_live(
+        client,
+        &coord_pk,
+        VerificationSource::LnPeer,
+        ln_node_id,
+        &sender.to_hex(),
+    )
+    .await
+    .context("state_unavailable: could not query relays for cap check")?;
+    if active_count >= max_active_vouches_per_peer as usize {
+        bail!(
+            "vouch_cap_hit: peer {ln_node_id} already has {active_count} active peer-tier vouches"
         );
-        if active_count >= max_active_vouches_per_peer as usize {
-            bail!(
-                "vouch_cap_hit: peer {ln_node_id} already has {active_count} active peer-tier vouches"
-            );
-        }
     }
 
     let ln_dir = lightning_dir.context("no lightning_dir configured for peer verification")?;
@@ -2407,14 +2332,8 @@ async fn try_peer_for_multi(
         let mut s = state.lock_state();
         s.vouches_published += 1;
         s.proofs_verified += 1;
-        s.record_active_vouch(
-            sender.to_hex(),
-            VerificationSource::LnPeer,
-            peer_result.verified_pubkey.clone(),
-            expires_at,
-        );
     }
-    let _ = peer_result.features_hex; // observed during handshake, not republished
+    let _ = (peer_result.features_hex, expires_at); // observed during handshake, not republished
     tracing::info!(
         sender = %sender,
         ln_node_id = %peer_result.verified_pubkey,
@@ -2697,26 +2616,32 @@ async fn handle_utxo_proof(
     }
 
     // Per-bitcoin-address cap check BEFORE subprocess work. Uses a
-    // truncated SHA-256 of the address as the cap key so the in-memory
-    // and on-relay views stay consistent (the published vouch carries
-    // only the hash, not the address).
+    // truncated SHA-256 of the address as the cap key so published
+    // vouches (which only carry the hash) are countable without
+    // leaking the address. Counts live from relays — Nostr is the
+    // single source of truth, nothing cached in memory.
     let btc_hash = events::btc_address_hash(btc_address);
+    let coord_pk = keys.public_key();
+    let active_count = match count_active_vouches_live(
+        client,
+        &coord_pk,
+        VerificationSource::BtcUtxo,
+        &btc_hash,
+        &sender.to_hex(),
+    )
+    .await
     {
-        let s = state.lock_state();
-        let active_count = s.count_active_by_source_and_identifier(
-            VerificationSource::BtcUtxo,
-            &btc_hash,
-            &sender.to_hex(),
-        );
-        if active_count >= max_active_vouches_per_ln_node as usize {
-            drop(s);
-            state
-                .lock_state()
-                .proofs_rejected_cap_hit += 1;
-            bail!(
-                "vouch cap hit: bitcoin address (hash {btc_hash}) already has {active_count} active vouches (cap {max_active_vouches_per_ln_node})"
-            );
+        Ok(n) => n,
+        Err(e) => {
+            state.lock_state().proofs_rejected_cap_hit += 1;
+            bail!("state_unavailable: could not query relays for cap check: {e}");
         }
+    };
+    if active_count >= max_active_vouches_per_ln_node as usize {
+        state.lock_state().proofs_rejected_cap_hit += 1;
+        bail!(
+            "vouch cap hit: bitcoin address (hash {btc_hash}) already has {active_count} active vouches (cap {max_active_vouches_per_ln_node})"
+        );
     }
 
     let btc_dir = bitcoin_dir
@@ -2749,17 +2674,8 @@ async fn handle_utxo_proof(
         expires_at,
     );
     let vouch_output = client.send_event_builder(builder).await?;
-    {
-        let mut s = state.lock_state();
-        s.vouches_published += 1;
-        s.record_active_vouch(
-            sender.to_hex(),
-            VerificationSource::BtcUtxo,
-            btc_hash.clone(),
-            expires_at,
-        );
-    }
-    let _ = (utxo_txid, utxo_vout, verified_balance_sat); // verified, not republished
+    state.lock_state().vouches_published += 1;
+    let _ = (utxo_txid, utxo_vout, verified_balance_sat, expires_at); // verified, not republished
     tracing::info!(
         sender = %sender,
         btc_address_hash = %btc_hash,
@@ -2863,23 +2779,28 @@ async fn handle_peer_proof(
     }
 
     // Per-peer-pubkey cap check — tighter than channel/utxo because
-    // peer has no chain anchor.
+    // peer has no chain anchor. Live relay query; no in-memory cache.
+    let coord_pk = keys.public_key();
+    let active_count = match count_active_vouches_live(
+        client,
+        &coord_pk,
+        VerificationSource::LnPeer,
+        ln_node_id,
+        &sender.to_hex(),
+    )
+    .await
     {
-        let s = state.lock_state();
-        let active_count = s.count_active_by_source_and_identifier(
-            VerificationSource::LnPeer,
-            ln_node_id,
-            &sender.to_hex(),
-        );
-        if active_count >= max_active_vouches_per_peer as usize {
-            drop(s);
-            state
-                .lock_state()
-                .proofs_rejected_cap_hit += 1;
-            bail!(
-                "vouch cap hit: peer {ln_node_id} already has {active_count} active peer-tier vouches (cap {max_active_vouches_per_peer})"
-            );
+        Ok(n) => n,
+        Err(e) => {
+            state.lock_state().proofs_rejected_cap_hit += 1;
+            bail!("state_unavailable: could not query relays for cap check: {e}");
         }
+    };
+    if active_count >= max_active_vouches_per_peer as usize {
+        state.lock_state().proofs_rejected_cap_hit += 1;
+        bail!(
+            "vouch cap hit: peer {ln_node_id} already has {active_count} active peer-tier vouches (cap {max_active_vouches_per_peer})"
+        );
     }
 
     // Attempt BOLT-8 handshake. Handshake success == key possession.
@@ -2908,17 +2829,8 @@ async fn handle_peer_proof(
         expires_at,
     );
     let vouch_output = client.send_event_builder(builder).await?;
-    {
-        let mut s = state.lock_state();
-        s.vouches_published += 1;
-        s.record_active_vouch(
-            sender.to_hex(),
-            VerificationSource::LnPeer,
-            peer_result.verified_pubkey.clone(),
-            expires_at,
-        );
-    }
-    let _ = peer_result.features_hex.clone(); // observed during handshake, not republished
+    state.lock_state().vouches_published += 1;
+    let _ = (peer_result.features_hex.clone(), expires_at); // observed, not republished
     tracing::info!(
         sender = %sender,
         ln_node_id = %peer_result.verified_pubkey,
@@ -3152,13 +3064,6 @@ async fn handle_proof_request_core(
         "proof-of-channel request received"
     );
 
-    // Refuse to process anything until the vouch table has been loaded
-    // from relays at startup. This prevents under-counting at cap check
-    // time during the brief window before the initial sync completes.
-    if !state.lock_state().vouch_table_loaded {
-        bail!("state_not_loaded: coordinator is still loading vouch table from relays, retry in a few seconds");
-    }
-
     // Validate the challenge
     let coordinator_npub = keys.public_key().to_bech32()?;
     if let Err(e) = validate_challenge(challenge, &coordinator_npub) {
@@ -3177,25 +3082,32 @@ async fn handle_proof_request_core(
         }
     }
 
-    // Per-LN-node cap check BEFORE verification — cheap in-memory
-    // lookup. Safe pre-verification because the cap counts only our
-    // own published vouches (authoritative), not the caller's claim.
+    // Per-LN-node cap check BEFORE verification. Counts our own
+    // published vouches from relays (the authoritative source) — the
+    // daemon holds no in-memory cap state, so every check is against
+    // fresh data and self-heals automatically if relays were briefly
+    // unreachable.
+    let coord_pk = keys.public_key();
+    let active_count = match count_active_vouches_live(
+        client,
+        &coord_pk,
+        VerificationSource::LnChannel,
+        node_id,
+        &sender.to_hex(),
+    )
+    .await
     {
-        let s = state.lock_state();
-        let active_count = s.count_active_by_source_and_identifier(
-            VerificationSource::LnChannel,
-            node_id,
-            &sender.to_hex(),
-        );
-        if active_count >= max_active_vouches_per_ln_node as usize {
-            drop(s);
-            state
-                .lock_state()
-                .proofs_rejected_cap_hit += 1;
-            bail!(
-                "vouch cap hit: LN node {node_id} already has {active_count} active vouches (cap {max_active_vouches_per_ln_node})"
-            );
+        Ok(n) => n,
+        Err(e) => {
+            state.lock_state().proofs_rejected_cap_hit += 1;
+            bail!("state_unavailable: could not query relays for cap check: {e}");
         }
+    };
+    if active_count >= max_active_vouches_per_ln_node as usize {
+        state.lock_state().proofs_rejected_cap_hit += 1;
+        bail!(
+            "vouch cap hit: LN node {node_id} already has {active_count} active vouches (cap {max_active_vouches_per_ln_node})"
+        );
     }
 
     // Verify signature via lightning-cli
@@ -3251,17 +3163,8 @@ async fn handle_proof_request_core(
         expires_at,
     );
     let vouch_output = client.send_event_builder(builder).await?;
-    {
-        let mut s = state.lock_state();
-        s.vouches_published += 1;
-        s.record_active_vouch(
-            sender.to_hex(),
-            VerificationSource::LnChannel,
-            node_id.to_string(),
-            expires_at,
-        );
-    }
-    let _ = (channels, capacity_sat); // accepted in payload, not republished
+    state.lock_state().vouches_published += 1;
+    let _ = (channels, capacity_sat, expires_at); // accepted in payload, not republished
     tracing::info!(
         sender = %sender,
         node_id = %node_id,
@@ -3303,13 +3206,26 @@ fn load_keys(key_file: &PathBuf) -> Result<Keys> {
     Ok(Keys::new(secret))
 }
 
-/// Count active vouches this coordinator has issued for a given LN
-/// node via a relay query. Used by the one-shot CLI `vouch` path
-/// where the daemon's in-memory table isn't available.
-async fn count_active_vouches_for_ln_node(
+/// Count active vouches this coordinator has published for a given
+/// (tier, identifier) pair via a live relay query. The daemon keeps no
+/// in-memory cap cache — every cap check goes straight to relays, so
+/// Nostr is the single source of truth and every decision is against
+/// fresh data. Self-heals by construction: if relays were unreachable,
+/// the next proof request just re-queries; there's no stale cache to
+/// go wrong.
+///
+/// `exclude_d_tag` is the host pubkey (hex) currently being
+/// (re-)vouched — its own prior vouch must not count against the cap
+/// because it's about to be superseded on the same d-tag.
+///
+/// Errors propagate to the caller, which should reject the proof with
+/// `state_unavailable`. That's strictly correct behavior — publishing
+/// a vouch while unable to verify caps could over-cap silently.
+async fn count_active_vouches_live(
     client: &Client,
     coordinator_pubkey: &PublicKey,
-    ln_node_id: &str,
+    source: VerificationSource,
+    identifier: &str,
     exclude_d_tag: &str,
 ) -> Result<usize> {
     let filter = Filter::new()
@@ -3317,166 +3233,70 @@ async fn count_active_vouches_for_ln_node(
         .author(*coordinator_pubkey)
         .limit(500);
 
-    let events = client.fetch_events(filter, Duration::from_secs(5)).await?;
+    let events = client
+        .fetch_events(filter, Duration::from_secs(5))
+        .await
+        .context("relay query for cap check")?;
+
+    let want_tier = match source {
+        VerificationSource::LnChannel => events::VouchTier::Channel,
+        VerificationSource::BtcUtxo => events::VouchTier::Utxo,
+        VerificationSource::LnPeer => events::VouchTier::Peer,
+    };
 
     let count = events
         .into_iter()
         .filter(events::vouch_is_active)
-        .filter(|e| events::vouch_ln_node_id(e).as_deref() == Some(ln_node_id))
+        .filter(|e| {
+            e.tags
+                .iter()
+                .find(|t| {
+                    t.kind()
+                        == TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::L))
+                })
+                .and_then(|t| t.content())
+                .and_then(events::VouchTier::from_l_tag)
+                == Some(want_tier)
+        })
+        .filter(|e| {
+            let got = match source {
+                VerificationSource::LnChannel | VerificationSource::LnPeer => {
+                    events::vouch_ln_node_id(e)
+                }
+                VerificationSource::BtcUtxo => events::get_tag_value(e, "btc_hash"),
+            };
+            got.as_deref() == Some(identifier)
+        })
         .filter(|e| events::get_d_tag(e).as_deref() != Some(exclude_d_tag))
         .count();
 
     Ok(count)
 }
 
-/// Query relays for every vouch this coordinator has published and
-/// rebuild the in-memory table from authoritative Nostr state. Called
-/// at daemon startup and periodically thereafter to catch drift.
+/// Fetch the currently-live vouch event this coordinator published for
+/// a given host d-tag. Used by the revoke path to read the prior
+/// vouch's tier and NIP-40 expiration so the revoke event preserves
+/// the tier label and outlives the original by one day — otherwise a
+/// tightened vouch_expiry_days config could leave the revoke expiring
+/// before the vouch it's revoking.
 ///
-/// Returns `Ok(count)` on success (number of entries loaded). On
-/// error, leaves the existing table untouched so transient relay
-/// flakes don't flush our state.
-async fn sync_vouch_table(
+/// Returns `None` if no vouch is found or the relay fetch fails; the
+/// caller is expected to fall back to sensible defaults.
+async fn fetch_prior_vouch(
     client: &Client,
     coordinator_pubkey: &PublicKey,
-    state: &std::sync::Arc<std::sync::Mutex<DaemonState>>,
-) -> Result<usize> {
+    host_d_tag: &str,
+) -> Option<Event> {
     let filter = Filter::new()
         .kind(kinds::VOUCH)
         .author(*coordinator_pubkey)
-        .limit(1000);
-
-    let events = client
-        .fetch_events(filter, Duration::from_secs(10))
+        .limit(500);
+    client
+        .fetch_events(filter, Duration::from_secs(5))
         .await
-        .context("relay query for vouch table sync")?;
-
-    let mut fresh = std::collections::HashMap::new();
-    let now = Timestamp::now().as_secs();
-
-    for event in events.into_iter() {
-        let Some(d_tag) = events::get_d_tag(&event) else {
-            continue;
-        };
-
-        // Pull NIP-40 expiration from tags
-        let mut expires_at = 0u64;
-        for tag in event.tags.iter() {
-            if tag.kind() == TagKind::Expiration
-                && let Some(s) = tag.content()
-                && let Ok(e) = s.parse::<u64>()
-            {
-                expires_at = e;
-                break;
-            }
-        }
-
-        // Drop events already past their NIP-40 expiration — relays may
-        // still serve them briefly but they have no active authority.
-        if expires_at != 0 && expires_at <= now {
-            continue;
-        }
-
-        // Parse content — status, verification_source, and the
-        // method-specific identifier field.
-        let content_v: serde_json::Value = match serde_json::from_str(&event.content) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-
-        let status = content_v
-            .get("status")
-            .and_then(|s| s.as_str())
-            .map(|s| {
-                if s == "revoked" {
-                    VouchStatus::Revoked
-                } else {
-                    VouchStatus::Active
-                }
-            })
-            .unwrap_or(VouchStatus::Active);
-
-        // Tier comes from the `["l", ...]` tag (the unified format
-        // dropped the redundant `verification_source` content field).
-        // Falls back to LnChannel for legacy events that predate either.
-        let source = event
-            .tags
-            .iter()
-            .find(|t| t.kind() == TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::L)))
-            .and_then(|t| t.content())
-            .and_then(events::VouchTier::from_l_tag)
-            .map(|t| match t {
-                events::VouchTier::Channel => VerificationSource::LnChannel,
-                events::VouchTier::Utxo => VerificationSource::BtcUtxo,
-                events::VouchTier::Peer => VerificationSource::LnPeer,
-            })
-            .or_else(|| {
-                content_v
-                    .get("verification_source")
-                    .and_then(|s| s.as_str())
-                    .and_then(VerificationSource::from_content_str)
-            })
-            .unwrap_or(VerificationSource::LnChannel);
-
-        // Extract the cap-tracking identifier per tier:
-        // - channel/peer: ln_node_id (same as the contact pubkey)
-        // - utxo: the daemon-internal `btc_hash` tag (truncated SHA-256
-        //   of the verified bitcoin address). Lets cap state survive
-        //   restarts without leaking the address. Legacy events with a
-        //   plaintext `btc_address` content field fall back to that.
-        let identifier = match source {
-            VerificationSource::LnChannel | VerificationSource::LnPeer => {
-                events::vouch_ln_node_id(&event).or_else(|| {
-                    // Legacy peer-tier events used "peer_pubkey" content key.
-                    content_v
-                        .get("peer_pubkey")
-                        .and_then(|v| v.as_str())
-                        .map(String::from)
-                })
-            }
-            VerificationSource::BtcUtxo => events::get_tag_value(&event, "btc_hash").or_else(|| {
-                content_v
-                    .get("btc_address")
-                    .and_then(|v| v.as_str())
-                    .map(String::from)
-            }),
-        };
-        let Some(identifier) = identifier else {
-            continue;
-        };
-
-        fresh.insert(
-            d_tag,
-            ActiveVouch {
-                source,
-                identifier,
-                expires_at,
-                status,
-            },
-        );
-    }
-
-    let count = fresh.len();
-
-    let mut guard = state.lock_state();
-
-    // Log drift if this isn't the initial sync.
-    if guard.vouch_table_loaded {
-        let prev_size = guard.active_vouches.len();
-        if prev_size != count {
-            tracing::warn!(
-                prev_size,
-                new_size = count,
-                "vouch table re-sync changed entry count"
-            );
-        }
-    }
-
-    guard.active_vouches = fresh;
-    guard.vouch_table_loaded = true;
-    guard.vouch_table_last_synced_at = now;
-
-    Ok(count)
+        .ok()?
+        .into_iter()
+        .find(|e| events::get_d_tag(e).as_deref() == Some(host_d_tag))
 }
 
 /// Result of a successful BOLT-8 peer handshake attempt.

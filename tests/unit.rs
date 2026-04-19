@@ -235,6 +235,46 @@ fn revoke_vouch_shares_d_tag_and_marks_revoked() {
     assert!(parsed.get("reason").is_none());
 }
 
+// --- G: revoke expiry outlives the vouch it revokes ---
+
+/// The revoke CLI path reads the prior vouch's NIP-40 expiration and
+/// stamps the revoke with `original + 86400`. This test locks down
+/// the `build_revoke_vouch` contract that underpins that behavior: the
+/// expiration tag on the revoke event is exactly what the caller
+/// passes. The caller (cmd_revoke_vouch) is responsible for computing
+/// `original_expires_at + 86400`; this keeps the event builder
+/// honest so the CLI math lands in the published event unchanged.
+#[test]
+fn revoke_vouch_expiration_tag_matches_caller_argument() {
+    let coord = Keys::generate();
+    let host = Keys::generate();
+
+    let original_expiry = 1_800_000_000u64;
+    let revoke_expiry = original_expiry + 86400;
+
+    let ev = events::build_revoke_vouch(&host.public_key(), events::VouchTier::Utxo, revoke_expiry)
+        .sign_with_keys(&coord)
+        .unwrap();
+
+    let tag_expiry = ev
+        .tags
+        .iter()
+        .find(|t| t.kind() == TagKind::Expiration)
+        .and_then(|t| t.content())
+        .and_then(|s| s.parse::<u64>().ok())
+        .expect("revoke event must carry a NIP-40 expiration tag");
+    assert_eq!(tag_expiry, revoke_expiry);
+    assert!(
+        tag_expiry > original_expiry,
+        "revoke must outlive the vouch it revokes by construction"
+    );
+    assert_eq!(tag_expiry - original_expiry, 86400);
+
+    // Tier is preserved per caller argument too.
+    let l = l_tag(&ev);
+    assert_eq!(l.as_deref(), Some("utxo"));
+}
+
 // --- NIP-44 encryption round-trip (proof DM envelope) ---
 
 #[test]
