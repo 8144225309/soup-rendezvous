@@ -105,7 +105,7 @@ The `btc_address`, `utxo_txid`, `utxo_vout`, and `verified_balance_sat` are deli
 In order (cheap checks first):
 
 1. Request has `type: "proof_of_utxo"`.
-2. Challenge has the right prefix, coordinator npub, and the timestamp is within ±5 minutes.
+2. Challenge has the right prefix, coordinator npub, and the host-clock timestamp embedded in the challenge is within ±5 minutes of the coordinator's clock at verification. Hosts with NTP drift will see `challenge_expired`.
 3. Replay cache: `(sender, challenge)` not seen in the last 10 minutes.
 4. **Per-btc-address cap** (default 10 active vouches): cheap in-memory lookup. If at cap, reject before doing any subprocess work.
 5. `bitcoin-cli verifymessage` returns `true` for the provided `(btc_address, signature, challenge)` tuple.
