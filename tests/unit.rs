@@ -87,7 +87,10 @@ fn utxo_vouch_unified_format_carries_ln_contact_and_btc_hash() {
     .unwrap();
 
     assert_eq!(l_tag(&ev).as_deref(), Some("utxo"));
-    assert_eq!(events::vouch_ln_node_id(&ev).as_deref(), Some("03utxohostnode"));
+    assert_eq!(
+        events::vouch_ln_node_id(&ev).as_deref(),
+        Some("03utxohostnode")
+    );
     assert_eq!(
         events::get_tag_value(&ev, "btc_hash").as_deref(),
         Some(btc_hash.as_str())
@@ -127,7 +130,10 @@ fn peer_vouch_unified_format_uses_ln_node_id_naming() {
     .unwrap();
 
     assert_eq!(l_tag(&ev).as_deref(), Some("peer"));
-    assert_eq!(events::vouch_ln_node_id(&ev).as_deref(), Some("03peerexample"));
+    assert_eq!(
+        events::vouch_ln_node_id(&ev).as_deref(),
+        Some("03peerexample")
+    );
 
     let parsed: serde_json::Value = serde_json::from_str(&ev.content).unwrap();
     assert_eq!(parsed["status"], "active");
@@ -216,10 +222,13 @@ fn revoke_vouch_shares_d_tag_and_marks_revoked() {
     .sign_with_keys(&coord)
     .unwrap();
     let revoke_expiry = Timestamp::now().as_secs() + 30 * 86400;
-    let revoked =
-        events::build_revoke_vouch(&host.public_key(), events::VouchTier::Channel, revoke_expiry)
-            .sign_with_keys(&coord)
-            .unwrap();
+    let revoked = events::build_revoke_vouch(
+        &host.public_key(),
+        events::VouchTier::Channel,
+        revoke_expiry,
+    )
+    .sign_with_keys(&coord)
+    .unwrap();
 
     assert_eq!(active.kind, revoked.kind);
     assert_eq!(events::get_d_tag(&active), events::get_d_tag(&revoked));
@@ -297,12 +306,8 @@ fn nip44_round_trip_for_proof_dm() {
     .unwrap();
     assert_ne!(encrypted, plaintext);
 
-    let decrypted = nip44::decrypt(
-        coord_keys.secret_key(),
-        &host_keys.public_key(),
-        &encrypted,
-    )
-    .unwrap();
+    let decrypted =
+        nip44::decrypt(coord_keys.secret_key(), &host_keys.public_key(), &encrypted).unwrap();
     assert_eq!(decrypted, plaintext);
 }
 

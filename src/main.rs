@@ -66,7 +66,11 @@ struct Cli {
     /// can still get multiple vouches for the same LN node, but not
     /// unbounded. Prevents amplification attacks where one node floods
     /// the coordinator's attestation list under many Nostr identities.
-    #[arg(long, env = "SOUP_MAX_ACTIVE_VOUCHES_PER_LN_NODE", default_value_t = 10)]
+    #[arg(
+        long,
+        env = "SOUP_MAX_ACTIVE_VOUCHES_PER_LN_NODE",
+        default_value_t = 10
+    )]
     max_active_vouches_per_ln_node: u32,
 
     /// Path to bitcoind data directory. Required for proof-of-utxo
@@ -405,7 +409,13 @@ async fn main() -> Result<()> {
             let client = connect(&cli.relays, &keys, cli.proxy_url.as_deref()).await?;
             let ln_addresses_vec: Vec<String> = ln_addresses
                 .as_deref()
-                .map(|s| s.split(',').map(str::trim).filter(|s| !s.is_empty()).map(String::from).collect())
+                .map(|s| {
+                    s.split(',')
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(String::from)
+                        .collect()
+                })
                 .unwrap_or_default();
             cmd_request_vouch_utxo(
                 &client,
@@ -456,7 +466,13 @@ async fn main() -> Result<()> {
             let client = connect(&cli.relays, &keys, cli.proxy_url.as_deref()).await?;
             let utxo_ln_addresses_vec: Vec<String> = utxo_ln_addresses
                 .as_deref()
-                .map(|s| s.split(',').map(str::trim).filter(|s| !s.is_empty()).map(String::from).collect())
+                .map(|s| {
+                    s.split(',')
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(String::from)
+                        .collect()
+                })
                 .unwrap_or_default();
             cmd_request_vouch_multi(
                 &client,
@@ -666,8 +682,14 @@ async fn cmd_vouch(
     println!("  host nostr:  {}", host_pk);
     println!("  ln node:     {}", node_id);
     println!("  channels:    {} (verified, not republished)", channels);
-    println!("  capacity:    {} sat (verified, not republished)", capacity_sat);
-    println!("  expires in:  {} days (host must re-prove before then)", expiry_days);
+    println!(
+        "  capacity:    {} sat (verified, not republished)",
+        capacity_sat
+    );
+    println!(
+        "  expires in:  {} days (host must re-prove before then)",
+        expiry_days
+    );
     Ok(())
 }
 
@@ -703,8 +725,7 @@ async fn cmd_revoke_vouch(
                 .tags
                 .iter()
                 .find(|t| {
-                    t.kind()
-                        == TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::L))
+                    t.kind() == TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::L))
                 })
                 .and_then(|t| t.content())
                 .and_then(events::VouchTier::from_l_tag)
@@ -732,13 +753,12 @@ async fn cmd_revoke_vouch(
     println!("vouch revoked");
     println!("  event id:    {}", output.id());
     println!("  host nostr:  {host_pk}");
-    println!("  tier:        {} (preserved from prior vouch)", tier.as_l_tag());
     println!(
-        "  expires at:  {revoke_expires_at} (one day past the prior vouch's expiration)"
+        "  tier:        {} (preserved from prior vouch)",
+        tier.as_l_tag()
     );
-    println!(
-        "  reason:      {reason} (operator-side audit only; not in published event)"
-    );
+    println!("  expires at:  {revoke_expires_at} (one day past the prior vouch's expiration)");
+    println!("  reason:      {reason} (operator-side audit only; not in published event)");
     println!();
     println!("relays will supersede the prior 'active' vouch for this host.");
     Ok(())
@@ -804,7 +824,6 @@ async fn cmd_list_vouches(
     }
     Ok(())
 }
-
 
 async fn cmd_request_vouch(
     client: &Client,
@@ -944,7 +963,9 @@ async fn cmd_request_vouch_utxo(
             String::from_utf8_lossy(&sign_output.stderr)
         );
     }
-    let signature = String::from_utf8_lossy(&sign_output.stdout).trim().to_string();
+    let signature = String::from_utf8_lossy(&sign_output.stdout)
+        .trim()
+        .to_string();
 
     // Build the proof request payload. ln_node_id is host-declared
     // contact (not verified by the UTXO proof — first-dial failure
@@ -1101,8 +1122,7 @@ async fn cmd_request_vouch_multi(
 
     // Channel proof (strongest — placed first)
     if include_channel {
-        let ln_dir =
-            lightning_dir.context("--include-channel requires --lightning-dir")?;
+        let ln_dir = lightning_dir.context("--include-channel requires --lightning-dir")?;
         let challenge = format!(
             "soup-rendezvous:proof-of-channel:v0:{}:{}:{}",
             coord_npub,
@@ -1179,7 +1199,9 @@ async fn cmd_request_vouch_multi(
                 String::from_utf8_lossy(&sign_output.stderr)
             );
         }
-        let signature = String::from_utf8_lossy(&sign_output.stdout).trim().to_string();
+        let signature = String::from_utf8_lossy(&sign_output.stdout)
+            .trim()
+            .to_string();
 
         // For multi-method DMs, if a channel proof is also being sent
         // and the host didn't pass --utxo-ln-node-id, default to the
@@ -1187,9 +1209,9 @@ async fn cmd_request_vouch_multi(
         let utxo_node = match utxo_ln_node_id {
             Some(s) => s.to_string(),
             None => {
-                if include_channel && lightning_dir.is_some() {
+                if let Some(dir) = lightning_dir.as_ref().filter(|_| include_channel) {
                     let info_output = std::process::Command::new("lightning-cli")
-                        .arg(format!("--lightning-dir={}", lightning_dir.unwrap().display()))
+                        .arg(format!("--lightning-dir={}", dir.display()))
                         .arg("getinfo")
                         .output()
                         .context("lightning-cli getinfo failed for utxo ln_node_id derivation")?;
@@ -1221,8 +1243,7 @@ async fn cmd_request_vouch_multi(
 
     // Peer proof (weakest — placed last)
     if include_peer {
-        let ln_dir =
-            lightning_dir.context("--include-peer requires --lightning-dir")?;
+        let ln_dir = lightning_dir.context("--include-peer requires --lightning-dir")?;
         let addrs = peer_addresses.context("--include-peer requires --peer-addresses")?;
         let addresses: Vec<String> = addrs
             .split(',')
@@ -1263,7 +1284,10 @@ async fn cmd_request_vouch_multi(
     });
 
     println!("requesting multi-method vouch from {coord_npub}");
-    println!("  methods: {} proof(s) in order of preference", proofs.len());
+    println!(
+        "  methods: {} proof(s) in order of preference",
+        proofs.len()
+    );
 
     let encrypted = nip44::encrypt(
         keys.secret_key(),
@@ -1277,7 +1301,9 @@ async fn cmd_request_vouch_multi(
     println!("multi proof request sent (encrypted to coordinator)");
     println!("  event id: {}", dm_output.id());
     println!();
-    println!("coordinator will try methods in order and publish a vouch at the first one that succeeds.");
+    println!(
+        "coordinator will try methods in order and publish a vouch at the first one that succeeds."
+    );
     println!("check with: soup-rendezvous list-vouches --coordinator {coord_npub}");
     Ok(())
 }
@@ -1746,9 +1772,7 @@ async fn cmd_daemon(
             ticker.tick().await; // skip the immediate first tick
             loop {
                 ticker.tick().await;
-                let summary = state
-                    .lock_state()
-                    .metrics_summary();
+                let summary = state.lock_state().metrics_summary();
                 tracing::info!("{summary}");
             }
         });
@@ -1971,8 +1995,7 @@ fn load_processed_events(
         map.insert(id, ts);
     }
     if dropped > 0 {
-        let snapshot: Vec<(u64, EventId)> =
-            map.iter().map(|(id, ts)| (*ts, *id)).collect();
+        let snapshot: Vec<(u64, EventId)> = map.iter().map(|(id, ts)| (*ts, *id)).collect();
         save_processed_events(path, &snapshot);
     }
     tracing::info!(
@@ -2126,12 +2149,16 @@ async fn handle_proof_request(
 /// True if `s` is exactly 64 lowercase hex characters — the format
 /// bitcoin tx hashes are rendered in by every RPC we interact with.
 fn is_valid_txid(s: &str) -> bool {
-    s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    s.len() == 64
+        && s.bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
 }
 
 /// Coarse bitcoin address validator. Accepts:
+///
 ///   - legacy base58 (starts with 1, 3, m, n, 2; 25-35 chars of base58 alphabet)
 ///   - bech32 / bech32m (starts with bc1, tb1, bcrt1; 14-90 total chars)
+///
 /// This is an input-sanitization filter, not a consensus check. The
 /// real address validity test happens in bitcoin-cli verifymessage /
 /// gettxout. We just reject obviously malformed strings before
@@ -2181,9 +2208,7 @@ async fn try_channel_for_multi(
     coordinator_npub: &str,
     audit_claimed_id: &mut String,
 ) -> Result<()> {
-    let node_id = proof["node_id"]
-        .as_str()
-        .context("missing node_id field")?;
+    let node_id = proof["node_id"].as_str().context("missing node_id field")?;
     *audit_claimed_id = node_id.to_string();
     let zbase = proof["zbase"].as_str().context("missing zbase field")?;
     let challenge = proof["challenge"]
@@ -2217,7 +2242,10 @@ async fn try_channel_for_multi(
         .output()
         .context("failed to run lightning-cli checkmessage")?;
     if !output.status.success() {
-        bail!("checkmessage_failed: {}", String::from_utf8_lossy(&output.stderr));
+        bail!(
+            "checkmessage_failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
     let parsed: serde_json::Value =
         serde_json::from_slice(&output.stdout).context("failed to parse checkmessage output")?;
@@ -2311,7 +2339,11 @@ async fn try_utxo_for_multi(
         .context("missing ln_node_id field (required since vouches are contact pointers)")?;
     let ln_addresses: Vec<String> = proof["ln_addresses"]
         .as_array()
-        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default();
 
     if !is_valid_txid(utxo_txid) {
@@ -2341,13 +2373,17 @@ async fn try_utxo_for_multi(
         );
     }
 
-    let btc_dir =
-        bitcoin_dir.context("btc_verification_not_configured: no bitcoin_dir set")?;
+    let btc_dir = bitcoin_dir.context("btc_verification_not_configured: no bitcoin_dir set")?;
     if !verify_btc_signature(btc_dir, btc_address, signature, challenge)? {
         bail!("signature_invalid: verifymessage returned false");
     }
-    let verified_balance_sat =
-        check_utxo(btc_dir, utxo_txid, utxo_vout, btc_address, min_utxo_balance_sat)?;
+    let verified_balance_sat = check_utxo(
+        btc_dir,
+        utxo_txid,
+        utxo_vout,
+        btc_address,
+        min_utxo_balance_sat,
+    )?;
 
     let expires_at = Timestamp::now().as_secs() + vouch_expiry_days * 86400;
     let builder = events::build_vouch(
@@ -2519,9 +2555,7 @@ async fn handle_multi_proof(
         .as_array()
         .context("format_invalid: missing proofs array")?;
     if proofs.is_empty() {
-        state
-            .lock_state()
-            .proofs_rejected_format += 1;
+        state.lock_state().proofs_rejected_format += 1;
         bail!("format_invalid: empty proofs array");
     }
 
@@ -2710,7 +2744,11 @@ async fn handle_utxo_proof(
         .context("missing ln_node_id field (required since vouches are contact pointers)")?;
     let ln_addresses: Vec<String> = request["ln_addresses"]
         .as_array()
-        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default();
 
     // Format-validate before spending any subprocess work. These
@@ -2718,26 +2756,18 @@ async fn handle_utxo_proof(
     // instead of paying for a bitcoin-cli round trip that would also
     // reject them, just slower.
     if !is_valid_txid(utxo_txid) {
-        state
-            .lock_state()
-            .proofs_rejected_format += 1;
+        state.lock_state().proofs_rejected_format += 1;
         bail!("format_invalid: utxo_txid must be 64 lowercase hex characters");
     }
     if !is_valid_btc_address(btc_address) {
-        state
-            .lock_state()
-            .proofs_rejected_format += 1;
-        bail!(
-            "format_invalid: btc_address is not a recognized bitcoin address format"
-        );
+        state.lock_state().proofs_rejected_format += 1;
+        bail!("format_invalid: btc_address is not a recognized bitcoin address format");
     }
 
     // Validate the challenge format (prefix, npub, freshness).
     let coordinator_npub = keys.public_key().to_bech32()?;
     if let Err(e) = validate_utxo_challenge(challenge, &coordinator_npub) {
-        state
-            .lock_state()
-            .proofs_rejected_format += 1;
+        state.lock_state().proofs_rejected_format += 1;
         return Err(e);
     }
 
@@ -2783,17 +2813,20 @@ async fn handle_utxo_proof(
 
     // Cryptographic check: signature was made by the claimed address.
     if !verify_btc_signature(btc_dir, btc_address, signature, challenge)? {
-        state
-            .lock_state()
-            .proofs_rejected_signature += 1;
+        state.lock_state().proofs_rejected_signature += 1;
         bail!(
             "signature verification failed: verifymessage returned false for address {btc_address}"
         );
     }
 
     // UTXO check: exists, unspent, matches address, meets threshold.
-    let verified_balance_sat =
-        check_utxo(btc_dir, utxo_txid, utxo_vout, btc_address, min_utxo_balance_sat)?;
+    let verified_balance_sat = check_utxo(
+        btc_dir,
+        utxo_txid,
+        utxo_vout,
+        btc_address,
+        min_utxo_balance_sat,
+    )?;
 
     state.lock_state().proofs_verified += 1;
 
@@ -2891,18 +2924,14 @@ async fn handle_peer_proof(
         .filter_map(|v| v.as_str().map(String::from))
         .collect();
     if addresses.is_empty() {
-        state
-            .lock_state()
-            .proofs_rejected_format += 1;
+        state.lock_state().proofs_rejected_format += 1;
         bail!("format_invalid: addresses array is empty");
     }
 
     // Challenge format + freshness.
     let coordinator_npub = keys.public_key().to_bech32()?;
     if let Err(e) = validate_peer_challenge(challenge, &coordinator_npub) {
-        state
-            .lock_state()
-            .proofs_rejected_format += 1;
+        state.lock_state().proofs_rejected_format += 1;
         return Err(e);
     }
 
@@ -2945,9 +2974,7 @@ async fn handle_peer_proof(
     let peer_result = match try_peer_connect(ln_dir, ln_node_id, &addresses) {
         Ok(r) => r,
         Err(e) => {
-            state
-                .lock_state()
-                .proofs_rejected_signature += 1;
+            state.lock_state().proofs_rejected_signature += 1;
             return Err(e);
         }
     };
@@ -3068,9 +3095,7 @@ async fn handle_proof_request_core(
     let plaintext = match nip44::decrypt(keys.secret_key(), &sender, &event.content) {
         Ok(p) => p,
         Err(e) => {
-            state
-                .lock_state()
-                .dms_decrypt_failed += 1;
+            state.lock_state().dms_decrypt_failed += 1;
             return Err(anyhow::anyhow!(
                 "failed to decrypt DM (not NIP-44 or not addressed to us): {}",
                 e
@@ -3192,9 +3217,7 @@ async fn handle_proof_request_core(
     // Validate the challenge
     let coordinator_npub = keys.public_key().to_bech32()?;
     if let Err(e) = validate_challenge(challenge, &coordinator_npub) {
-        state
-            .lock_state()
-            .proofs_rejected_format += 1;
+        state.lock_state().proofs_rejected_format += 1;
         return Err(e);
     }
 
@@ -3258,15 +3281,11 @@ async fn handle_proof_request_core(
     let recovered_pubkey = result["pubkey"].as_str().unwrap_or("");
 
     if !verified {
-        state
-            .lock_state()
-            .proofs_rejected_signature += 1;
+        state.lock_state().proofs_rejected_signature += 1;
         bail!("signature verification failed: checkmessage returned verified=false");
     }
     if recovered_pubkey != node_id {
-        state
-            .lock_state()
-            .proofs_rejected_signature += 1;
+        state.lock_state().proofs_rejected_signature += 1;
         bail!(
             "node_id mismatch: claimed {} but signature recovers to {}",
             node_id,
@@ -3376,8 +3395,7 @@ async fn count_active_vouches_live(
             e.tags
                 .iter()
                 .find(|t| {
-                    t.kind()
-                        == TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::L))
+                    t.kind() == TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::L))
                 })
                 .and_then(|t| t.content())
                 .and_then(events::VouchTier::from_l_tag)
@@ -3455,10 +3473,7 @@ fn try_peer_connect(
             .context("failed to run lightning-cli connect")?;
 
         if !output.status.success() {
-            last_err = format!(
-                "{addr}: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
+            last_err = format!("{addr}: {}", String::from_utf8_lossy(&output.stderr).trim());
             continue;
         }
 
@@ -3472,9 +3487,8 @@ fn try_peer_connect(
 
         let recovered_id = parsed["id"].as_str().unwrap_or_default();
         if recovered_id != peer_id {
-            last_err = format!(
-                "{addr}: handshake auth mismatch (got {recovered_id}, expected {peer_id})"
-            );
+            last_err =
+                format!("{addr}: handshake auth mismatch (got {recovered_id}, expected {peer_id})");
             continue;
         }
 
@@ -3594,16 +3608,13 @@ fn check_utxo(
 
 async fn connect(relays_csv: &str, keys: &Keys, proxy_url: Option<&str>) -> Result<Client> {
     let client = if let Some(proxy) = proxy_url {
-        let addr: std::net::SocketAddr = proxy
-            .parse()
-            .with_context(|| format!("invalid proxy address '{proxy}' (want host:port, e.g. 127.0.0.1:9050)"))?;
+        let addr: std::net::SocketAddr = proxy.parse().with_context(|| {
+            format!("invalid proxy address '{proxy}' (want host:port, e.g. 127.0.0.1:9050)")
+        })?;
         tracing::info!(proxy = %addr, "routing nostr traffic through SOCKS5 proxy");
         let connection = Connection::new().proxy(addr);
         let opts = ClientOptions::new().connection(connection);
-        Client::builder()
-            .signer(keys.clone())
-            .opts(opts)
-            .build()
+        Client::builder().signer(keys.clone()).opts(opts).build()
     } else {
         Client::new(keys.clone())
     };

@@ -154,11 +154,9 @@ impl ConfigFile {
             )
         })?;
 
-        let relays = section
-            .relays
-            .as_ref()
-            .or(self.relays.as_ref())
-            .context("no relays configured (either global `relays` or per-network override required)")?;
+        let relays = section.relays.as_ref().or(self.relays.as_ref()).context(
+            "no relays configured (either global `relays` or per-network override required)",
+        )?;
         if relays.is_empty() {
             bail!("relay list is empty");
         }
@@ -235,10 +233,7 @@ relays = ["wss://relay.primal.net"]
     fn loads_and_resolves_default_network() {
         let cfg: ConfigFile = toml::from_str(sample()).unwrap();
         let resolved = cfg.resolve("signet").unwrap();
-        assert_eq!(
-            resolved.relays,
-            "wss://nos.lol,wss://relay.damus.io"
-        );
+        assert_eq!(resolved.relays, "wss://nos.lol,wss://relay.damus.io");
         assert_eq!(resolved.vouch_expiry_days, 30);
         assert_eq!(
             resolved.key_file,
